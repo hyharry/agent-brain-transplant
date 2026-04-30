@@ -39,7 +39,25 @@ LINE_SECRET_RE = re.compile(
 JSON_STRING_SECRET_RE = re.compile(
     r'(?i)("[^"\\]*(?:token|secret|password|passwd|oauth|api[_-]?key|client[_-]?id|client[_-]?secret|webhook|session|auth|chat_id|account_id|open_id|user_id|union_id)[^"\\]*"\s*:\s*")([^"\\]*(?:\\.[^"\\]*)*)(")'
 )
-SESSION_FILE_RE = re.compile(r".*session.*\.json$", re.IGNORECASE)
+SESSION_FILE_RE = re.compile(r".*(session|conversation|transcript|chat).*\.(json|jsonl)$", re.IGNORECASE)
+SESSION_DIR_NAMES = {
+    "session",
+    "sessions",
+    "current",
+    "current_sessions",
+    "past",
+    "past_sessions",
+    "history",
+    "histories",
+    "archive",
+    "archives",
+    "conversation",
+    "conversations",
+    "transcript",
+    "transcripts",
+    "chat",
+    "chats",
+}
 STATE_FILE_NAMES = {"STATE.md", "state.md", "TODO.md", "todo.md"}
 CORE_AGENT_FILES = {"AGENTS.md", "SOUL.md", "USER.md", "HEARTBEAT.md", "MEMORY.md", "IDENTITY.md", "TOOLS.md"}
 SKILL_DOC_NAMES = {"SKILL.md"}
@@ -130,6 +148,7 @@ class ApplySecretsPlan:
 class AgentInfo:
     name: str
     path: str
+    workspace_path: str | None
     platform: str
     state: str
     session_count: int
@@ -186,6 +205,8 @@ def discover_agent_paths(root: Path, agent_name: str | None = None, agent_path: 
     explicit_candidates = [
         root / "agents" / agent_name,
         root / agent_name,
+        root / "workspace" / agent_name,
+        root / "workspace",
         root / f"workspace-{agent_name}",
     ]
     for candidate in explicit_candidates:
@@ -198,16 +219,60 @@ def list_agent_paths(root: Path) -> list[Path]:
     seen: set[Path] = set()
     found: list[Path] = []
     agents_root = root / "agents"
+    has_agent_settings = False
     if agents_root.exists():
         for child in sorted(agents_root.iterdir()):
             if child.is_dir() and child not in seen:
+                has_agent_settings = True
                 seen.add(child)
                 found.append(child)
+    workspace_root = root / "workspace"
+    if not has_agent_settings and workspace_root.exists() and workspace_root.is_dir() and workspace_root not in seen:
+        seen.add(workspace_root)
+        found.append(workspace_root)
     for child in sorted(root.glob("workspace-*")):
-        if child.is_dir() and child not in seen:
+        workspace_name = child.name.removeprefix("workspace-")
+        matching_agent = root / "agents" / workspace_name
+        if child.is_dir() and child not in seen and not matching_agent.exists():
             seen.add(child)
             found.append(child)
     return found
+
+
+def _agent_name_from_path(root: Path, path: Path) -> str:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return path.name.removeprefix("workspace-")
+    if len(relative.parts) >= 2 and relative.parts[0] in {"agents", "workspace"}:
+        return relative.parts[1]
+    if relative.parts == ("workspace",):
+        return "main"
+    return path.name.removeprefix("workspace-")
+
+
+def _workspace_candidates(root: Path, name: str) -> list[Path]:
+    candidates = [
+        root / f"workspace-{name}",
+        root / "workspace" / name,
+    ]
+    workspace_root = root / "workspace"
+    if workspace_root.exists():
+        candidates.append(workspace_root)
+    return candidates
+
+
+def _workspace_path_for(root: Path, agent_path: Path, name: str) -> Path | None:
+    try:
+        relative = agent_path.relative_to(root)
+    except ValueError:
+        relative = Path()
+    if relative.parts and relative.parts[0].startswith("workspace"):
+        return agent_path
+    for candidate in _workspace_candidates(root, name):
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return None
 
 
 def classify_relative_path(relative: Path, profile: Profile, selected_agent_roots: list[Path], root: Path) -> str:
@@ -309,9 +374,20 @@ def _infer_agent_state(agent_path: Path) -> str:
 def _session_count(agent_path: Path) -> int:
     count = 0
     for file_path in agent_path.rglob("*"):
-        if file_path.is_file() and SESSION_FILE_RE.match(file_path.name):
+        if _is_session_record(file_path, agent_path):
             count += 1
     return count
+
+
+def _is_session_record(file_path: Path, base_path: Path) -> bool:
+    if not file_path.is_file() or file_path.suffix.lower() not in {".json", ".jsonl"}:
+        return False
+    try:
+        relative = file_path.relative_to(base_path)
+    except ValueError:
+        relative = Path(file_path.name)
+    parent_names = {part.lower() for part in relative.parts[:-1]}
+    return bool(SESSION_FILE_RE.match(file_path.name) or parent_names & SESSION_DIR_NAMES)
 
 
 def _skill_names(agent_path: Path) -> list[str]:
@@ -325,14 +401,20 @@ def _skill_names(agent_path: Path) -> list[str]:
 
 
 def get_agent_info(root: Path, agent_path: Path, profile_name: str) -> AgentInfo:
+    name = _agent_name_from_path(root, agent_path)
+    workspace_path = _workspace_path_for(root, agent_path, name)
+    stat_roots = [agent_path]
+    if workspace_path and workspace_path != agent_path:
+        stat_roots.append(workspace_path)
     core_files = [name for name in sorted(CORE_AGENT_FILES) if (agent_path / name).exists()]
     return AgentInfo(
-        name=agent_path.name.removeprefix("workspace-"),
+        name=name,
         path=str(agent_path),
+        workspace_path=str(workspace_path) if workspace_path else None,
         platform=normalize_profile_name(profile_name),
         state=_infer_agent_state(agent_path),
-        session_count=_session_count(agent_path),
-        workspace_bytes=_directory_size(agent_path),
+        session_count=sum(_session_count(path) for path in stat_roots),
+        workspace_bytes=_directory_size(workspace_path) if workspace_path else 0,
         skill_count=len(_skill_names(agent_path)),
         skills=_skill_names(agent_path),
         core_files=core_files,
@@ -371,6 +453,8 @@ def build_backup_manifest(
         else:
             candidates = [item for item in sorted(source_root.rglob("*")) if item.is_file()]
         for candidate in candidates:
+            if _is_session_record(candidate, root):
+                continue
             resolved = candidate.resolve()
             if resolved in seen:
                 continue

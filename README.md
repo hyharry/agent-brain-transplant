@@ -5,15 +5,17 @@ A small Python CLI for backing up and transplanting an OpenClaw or Hermes-agent 
 1. **Public phase**: copy platform settings, agent setup, and work files into a masked public bundle.
 2. **Secrets phase**: apply private values from a separate secrets file to make the transplant functional.
 
-The tool is meant to make agent setups portable without mixing ordinary project/config content with tokens, passwords, IDs, OAuth secrets, or similar sensitive values.
+The tool is meant to make agent setups portable without mixing ordinary project/config content with tokens, passwords, IDs, OAuth secrets, or similar sensitive values. Chat/session records are treated as ephemeral runtime state and are not backed up.
 
 ## What it can do now
 
 - back up OpenClaw or Hermes-agent roots
+  - includes memory, skills, and work/project files
+  - excludes current and past chat/session records
 - list detected agents/workspaces
 - show per-agent info
   - state
-  - inferred session count
+  - inferred total session count
   - workspace storage size
   - skills
   - core agent files present
@@ -54,8 +56,7 @@ Main commands:
 
 ```bash
 python3 -m agent_brain_transplant list-agents \
-  --profile openclaw \
-  --source-root ~/.openclaw
+  --profile openclaw
 ```
 
 ### Show detailed info for one agent
@@ -63,7 +64,6 @@ python3 -m agent_brain_transplant list-agents \
 ```bash
 python3 -m agent_brain_transplant agent-info \
   --profile openclaw \
-  --source-root ~/.openclaw \
   --agent-name suyu_code_it
 ```
 
@@ -72,7 +72,6 @@ python3 -m agent_brain_transplant agent-info \
 ```bash
 python3 -m agent_brain_transplant plan-backup \
   --profile openclaw \
-  --source-root ~/.openclaw \
   --agent-name suyu_code_it
 ```
 
@@ -81,7 +80,6 @@ python3 -m agent_brain_transplant plan-backup \
 ```bash
 python3 -m agent_brain_transplant backup \
   --profile openclaw \
-  --source-root ~/.openclaw \
   --agent-name suyu_code_it \
   --out-dir ./out/demo-backup
 ```
@@ -113,19 +111,25 @@ python3 -m agent_brain_transplant apply-secrets \
 ```bash
 python3 -m agent_brain_transplant backup \
   --profile hermes-agent \
-  --source-root ~/.hermes \
   --agent-name worker \
   --out-dir ./out/hermes-worker
 ```
+
+`--source-root` is optional for source commands:
+
+- `openclaw` defaults to `~/.openclaw`
+- `hermes` / `hermes-agent` default to `~/.hermes`
 
 ## What “agent info” means here
 
 The current implementation reports filesystem-inferred metadata:
 
 - **state**: inferred from `STATE.md` / `state.md` / `TODO.md` when present
-- **session count**: count of session-like JSON files under the agent/workspace path
+- **total session count**: count of current and past session-like JSON/JSONL files under the agent/workspace path
 - **workspace storage size**: recursive byte size of the agent/workspace directory
+- **memory size**: recursive byte size of the agent/workspace `memory/` directory when present
 - **skills**: skill directory names under `skills/`
+- **workspace files**: `agent-info` lists files and folders under the selected workspace with human-readable sizes
 
 This is intentionally simple and readable. It is not yet runtime/API-aware.
 
