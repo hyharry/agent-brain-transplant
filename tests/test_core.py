@@ -8,6 +8,8 @@ from agent_brain_transplant.core import (
     backup,
     build_backup_manifest,
     discover_agent_paths,
+    get_agent_info,
+    list_agents,
     mask_text,
     restore_public,
 )
@@ -111,6 +113,41 @@ class CoreTests(unittest.TestCase):
             (target / "f.txt").write_text("b", encoding="utf-8")
             with self.assertRaises(FileExistsError):
                 restore_public(bundle, target, dry_run=False, force=False)
+
+    def test_list_agents_and_agent_info(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            a1 = root / "agents" / "alpha"
+            a1.mkdir(parents=True)
+            (a1 / "AGENTS.md").write_text("hello", encoding="utf-8")
+            (a1 / "SOUL.md").write_text("hello", encoding="utf-8")
+            (a1 / "skills" / "demo").mkdir(parents=True)
+            (a1 / "skills" / "demo" / "SKILL.md").write_text("demo", encoding="utf-8")
+            (a1 / "chat_session_1.json").write_text("{}", encoding="utf-8")
+            (a1 / "STATE.md").write_text("status: in_progress", encoding="utf-8")
+
+            items = list_agents(root, "openclaw")
+            self.assertEqual(len(items), 1)
+            info = items[0]
+            self.assertEqual(info.name, "alpha")
+            self.assertEqual(info.state, "in_progress")
+            self.assertEqual(info.session_count, 1)
+            self.assertEqual(info.skill_count, 1)
+            self.assertIn("demo", info.skills)
+            self.assertIn("AGENTS.md", info.core_files)
+
+            direct = get_agent_info(root, a1, "openclaw")
+            self.assertEqual(direct.name, "alpha")
+            self.assertGreater(direct.workspace_bytes, 0)
+
+    def test_hermes_agent_alias_is_supported(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "hermes-agent.json").write_text('token="abc"', encoding="utf-8")
+            (root / "agents" / "worker").mkdir(parents=True)
+            manifest = build_backup_manifest(root, "hermes-agent", agent_name="worker")
+            self.assertEqual(manifest.profile, "hermes-agent")
+            self.assertGreaterEqual(manifest.categories["platform"], 1)
 
 
 if __name__ == "__main__":

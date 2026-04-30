@@ -6,7 +6,7 @@ import re
 import shutil
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterator
 
 
 TEXT_SUFFIXES = {
@@ -33,57 +33,49 @@ TEXT_SUFFIXES = {
     ".csv",
 }
 
-SECRET_KEYWORDS = [
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "oauth",
-    "api_key",
-    "apikey",
-    "client_id",
-    "client_secret",
-    "webhook",
-    "session",
-    "auth",
-]
-
-SENSITIVE_KEY_RE = re.compile(
-    r"(?i)(token|secret|password|passwd|oauth|api[_-]?key|client[_-]?id|client[_-]?secret|webhook|session|auth|chat_id|account_id|open_id|user_id|union_id)"
-)
 LINE_SECRET_RE = re.compile(
     r"(?im)^([ \t\"']*[A-Za-z0-9_.-]*?(?:token|secret|password|passwd|oauth|api[_-]?key|client[_-]?id|client[_-]?secret|webhook|session|auth|chat_id|account_id|open_id|user_id|union_id)[A-Za-z0-9_.-]*[ \t\"']*)([:=])([ \t]*)([^\n#]+)"
 )
 JSON_STRING_SECRET_RE = re.compile(
     r'(?i)("[^"\\]*(?:token|secret|password|passwd|oauth|api[_-]?key|client[_-]?id|client[_-]?secret|webhook|session|auth|chat_id|account_id|open_id|user_id|union_id)[^"\\]*"\s*:\s*")([^"\\]*(?:\\.[^"\\]*)*)(")'
 )
+SESSION_FILE_RE = re.compile(r".*session.*\.json$", re.IGNORECASE)
+STATE_FILE_NAMES = {"STATE.md", "state.md", "TODO.md", "todo.md"}
+CORE_AGENT_FILES = {"AGENTS.md", "SOUL.md", "USER.md", "HEARTBEAT.md", "MEMORY.md", "IDENTITY.md", "TOOLS.md"}
+SKILL_DOC_NAMES = {"SKILL.md"}
 
 
 @dataclass(frozen=True)
 class Profile:
     name: str
+    aliases: tuple[str, ...]
     platform_files: list[str]
     agent_roots: list[str]
     shared_roots: list[str]
     work_roots: list[str]
 
 
-PROFILES = {
-    "openclaw": Profile(
+_PROFILE_LIST = [
+    Profile(
         name="openclaw",
+        aliases=("openclaw",),
         platform_files=["openclaw.json"],
         agent_roots=["agents", "workspace-*"],
         shared_roots=["memory", "skills", "notes", "projects", "artifacts", "shared-agent-coordination.md"],
         work_roots=["memory", "notes", "projects", "artifacts"],
     ),
-    "hermes": Profile(
-        name="hermes",
+    Profile(
+        name="hermes-agent",
+        aliases=("hermes", "hermes-agent"),
         platform_files=["hermes.json", "hermes-agent.json"],
         agent_roots=["agents", "workspace-*"],
         shared_roots=["memory", "skills", "notes", "projects", "artifacts"],
         work_roots=["memory", "notes", "projects", "artifacts"],
     ),
-}
+]
+
+PROFILES = {alias: profile for profile in _PROFILE_LIST for alias in profile.aliases}
+CANONICAL_PROFILES = {profile.name: profile for profile in _PROFILE_LIST}
 
 
 @dataclass
@@ -134,12 +126,38 @@ class ApplySecretsPlan:
     changed_files: list[str]
 
 
+@dataclass
+class AgentInfo:
+    name: str
+    path: str
+    platform: str
+    state: str
+    session_count: int
+    workspace_bytes: int
+    skill_count: int
+    skills: list[str]
+    core_files: list[str]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 class PlannerError(ValueError):
     pass
 
 
-def _matches_any_glob(path: Path, patterns: list[str]) -> bool:
-    return any(path.match(pattern) for pattern in patterns)
+def normalize_profile_name(profile_name: str) -> str:
+    try:
+        return PROFILES[profile_name].name
+    except KeyError as error:
+        raise PlannerError(f"Unknown profile: {profile_name}") from error
+
+
+def get_profile(profile_name: str) -> Profile:
+    try:
+        return PROFILES[profile_name]
+    except KeyError as error:
+        raise PlannerError(f"Unknown profile: {profile_name}") from error
 
 
 def _iter_existing_roots(root: Path, patterns: list[str]) -> Iterator[Path]:
@@ -168,14 +186,27 @@ def discover_agent_paths(root: Path, agent_name: str | None = None, agent_path: 
     explicit_candidates = [
         root / "agents" / agent_name,
         root / agent_name,
+        root / f"workspace-{agent_name}",
     ]
     for candidate in explicit_candidates:
         if candidate.exists() and candidate not in found:
             found.append(candidate)
+    return found
 
-    for candidate in root.glob("workspace-*"):
-        if candidate.name == f"workspace-{agent_name}" and candidate.exists() and candidate not in found:
-            found.append(candidate)
+
+def list_agent_paths(root: Path) -> list[Path]:
+    seen: set[Path] = set()
+    found: list[Path] = []
+    agents_root = root / "agents"
+    if agents_root.exists():
+        for child in sorted(agents_root.iterdir()):
+            if child.is_dir() and child not in seen:
+                seen.add(child)
+                found.append(child)
+    for child in sorted(root.glob("workspace-*")):
+        if child.is_dir() and child not in seen:
+            seen.add(child)
+            found.append(child)
     return found
 
 
@@ -253,16 +284,74 @@ def mask_text(text: str, relative_path: str, secrets: dict[str, dict[str, str]])
     return masked, changed
 
 
+def _directory_size(path: Path) -> int:
+    total = 0
+    for file_path in path.rglob("*"):
+        if file_path.is_file():
+            try:
+                total += file_path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _infer_agent_state(agent_path: Path) -> str:
+    for name in STATE_FILE_NAMES:
+        state_file = agent_path / name
+        if state_file.exists():
+            text = state_file.read_text(encoding="utf-8", errors="ignore").lower()
+            for state in ("in_progress", "blocked", "done", "idle"):
+                if state in text:
+                    return state
+    return "present"
+
+
+def _session_count(agent_path: Path) -> int:
+    count = 0
+    for file_path in agent_path.rglob("*"):
+        if file_path.is_file() and SESSION_FILE_RE.match(file_path.name):
+            count += 1
+    return count
+
+
+def _skill_names(agent_path: Path) -> list[str]:
+    names: list[str] = []
+    skills_root = agent_path / "skills"
+    if skills_root.exists():
+        for skill_dir in sorted(skills_root.iterdir()):
+            if skill_dir.is_dir():
+                names.append(skill_dir.name)
+    return names
+
+
+def get_agent_info(root: Path, agent_path: Path, profile_name: str) -> AgentInfo:
+    core_files = [name for name in sorted(CORE_AGENT_FILES) if (agent_path / name).exists()]
+    return AgentInfo(
+        name=agent_path.name.removeprefix("workspace-"),
+        path=str(agent_path),
+        platform=normalize_profile_name(profile_name),
+        state=_infer_agent_state(agent_path),
+        session_count=_session_count(agent_path),
+        workspace_bytes=_directory_size(agent_path),
+        skill_count=len(_skill_names(agent_path)),
+        skills=_skill_names(agent_path),
+        core_files=core_files,
+    )
+
+
+def list_agents(root: Path, profile_name: str) -> list[AgentInfo]:
+    profile = get_profile(profile_name)
+    _ = profile
+    return [get_agent_info(root, path, profile_name) for path in list_agent_paths(root)]
+
+
 def build_backup_manifest(
     root: Path,
     profile_name: str,
     agent_name: str | None = None,
     agent_path: str | None = None,
 ) -> BackupManifest:
-    if profile_name not in PROFILES:
-        raise PlannerError(f"Unknown profile: {profile_name}")
-
-    profile = PROFILES[profile_name]
+    profile = get_profile(profile_name)
     selected_agent_roots = discover_agent_paths(root, agent_name=agent_name, agent_path=agent_path)
     if agent_name and not selected_agent_roots:
         raise PlannerError(f"Could not find agent '{agent_name}' under {root}")
@@ -292,20 +381,19 @@ def build_backup_manifest(
                 relative = Path("external") / candidate.name
             category = classify_relative_path(relative, profile, selected_agent_roots, root)
             text_mode = is_text_file(candidate)
-            masked = text_mode
             planned_files.append(
                 FilePlan(
                     source=str(candidate),
                     relative=str(relative),
                     category=category,
                     text_mode=text_mode,
-                    masked=masked,
+                    masked=text_mode,
                 )
             )
             category_counts[category] = category_counts.get(category, 0) + 1
 
     return BackupManifest(
-        profile=profile_name,
+        profile=profile.name,
         source_root=str(root),
         selected_agent_name=agent_name,
         selected_agent_path=agent_path,
