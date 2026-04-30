@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import fnmatch
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass, asdict
@@ -36,12 +37,18 @@ TEXT_SUFFIXES = {
 SLIM_SUFFIXES = {".md", ".markdown"}
 BACKUP_MODES = {"selected", "all", "config", "slim"}
 CONFIG_NAME_RE = re.compile(r".*(config|setting|settings|model|models).*", re.IGNORECASE)
+SECRET_KEY_PATTERN = (
+    r"token|secret|password|passwd|oauth|api[_-]?key|client[_-]?id|client[_-]?secret|"
+    r"webhook|session|auth|chat_id|account_id|open_id|user_id|union_id|"
+    r"feishu|telegram|tg[_-]?id|allow[_-]?list|allowlist|allowed[_-]?(?:id|ids|user|users)|"
+    r"allow[_-]?from|app[_-]?id|group[_-]?id|group[_-]?ids"
+)
 
 LINE_SECRET_RE = re.compile(
-    r"(?im)^([ \t\"']*[A-Za-z0-9_.-]*?(?:token|secret|password|passwd|oauth|api[_-]?key|client[_-]?id|client[_-]?secret|webhook|session|auth|chat_id|account_id|open_id|user_id|union_id)[A-Za-z0-9_.-]*[ \t\"']*)([:=])([ \t]*)([^\n#]+)"
+    rf"(?im)^([ \t\"']*[A-Za-z0-9_.-]*?(?:{SECRET_KEY_PATTERN})[A-Za-z0-9_.-]*[ \t\"']*)([:=])([ \t]*)([^\n#]+)"
 )
 JSON_STRING_SECRET_RE = re.compile(
-    r'(?i)("[^"\\]*(?:token|secret|password|passwd|oauth|api[_-]?key|client[_-]?id|client[_-]?secret|webhook|session|auth|chat_id|account_id|open_id|user_id|union_id)[^"\\]*"\s*:\s*")([^"\\]*(?:\\.[^"\\]*)*)(")'
+    rf'(?i)("[^"\\]*(?:{SECRET_KEY_PATTERN})[^"\\]*"\s*:\s*")([^"\\]*(?:\\.[^"\\]*)*)(")'
 )
 SESSION_FILE_RE = re.compile(r".*(session|conversation|transcript|chat).*\.(json|jsonl)$", re.IGNORECASE)
 SESSION_DIR_NAMES = {
@@ -83,7 +90,7 @@ _PROFILE_LIST = [
     Profile(
         name="openclaw",
         aliases=("openclaw",),
-        platform_files=["openclaw.json"],
+        platform_files=["openclaw.json", ".env"],
         agent_roots=["agents", "workspace-*"],
         shared_roots=["memory", "skills", "notes", "projects", "artifacts", "shared-agent-coordination.md"],
         work_roots=["memory", "notes", "projects", "artifacts"],
@@ -91,7 +98,7 @@ _PROFILE_LIST = [
     Profile(
         name="hermes-agent",
         aliases=("hermes", "hermes-agent"),
-        platform_files=["hermes.json", "hermes-agent.json"],
+        platform_files=["hermes.json", "hermes-agent.json", "SOUL.md", ".env"],
         agent_roots=["agents", "workspace-*"],
         shared_roots=["memory", "skills", "notes", "projects", "artifacts"],
         work_roots=["memory", "notes", "projects", "artifacts"],
@@ -122,6 +129,7 @@ class BackupManifest:
     file_count: int
     categories: dict[str, int]
     files: list[FilePlan]
+    warnings: list[str]
 
     def to_dict(self, *, compact_workspace: bool = True) -> dict:
         return {
@@ -133,6 +141,7 @@ class BackupManifest:
             "selected_agent_path": self.selected_agent_path,
             "file_count": self.file_count,
             "categories": self.categories,
+            "warnings": self.warnings,
             "files": _manifest_file_entries(self.files, compact_workspace=compact_workspace),
         }
 
@@ -234,6 +243,36 @@ def _iter_existing_roots(root: Path, patterns: list[str]) -> Iterator[Path]:
             candidate = root / pattern
             if candidate.exists():
                 yield candidate
+
+
+def _is_readable_root(path: Path) -> bool:
+    if path.is_dir():
+        return os.access(path, os.R_OK | os.X_OK)
+    return os.access(path, os.R_OK)
+
+
+def _hermes_access_warnings(root: Path) -> list[str]:
+    warnings: list[str] = []
+    for relative in ("memory", "skills", "workspace", "crons"):
+        candidate = root / relative
+        if not candidate.exists():
+            warnings.append(f"Hermes persistent root not found: {relative}")
+        elif not _is_readable_root(candidate):
+            warnings.append(f"Hermes persistent root is not accessible: {relative}")
+    return warnings
+
+
+def _safe_file_candidates(source_root: Path, root: Path, warnings: list[str]) -> list[Path]:
+    if not _is_readable_root(source_root):
+        warnings.append(f"Backup source is not accessible: {_relative_string(source_root, root)}")
+        return []
+    if source_root.is_file():
+        return [source_root]
+    try:
+        return [item for item in sorted(source_root.rglob("*")) if item.is_file()]
+    except OSError as error:
+        warnings.append(f"Could not scan backup source {_relative_string(source_root, root)}: {error}")
+        return []
 
 
 def _root_config_files(root: Path, profile: Profile) -> list[Path]:
@@ -398,7 +437,7 @@ def classify_relative_path(relative: Path, profile: Profile, selected_agent_root
 
 
 def is_text_file(path: Path) -> bool:
-    return path.suffix.lower() in TEXT_SUFFIXES
+    return path.name == ".env" or path.suffix.lower() in TEXT_SUFFIXES
 
 
 def _placeholder_for(relative_path: str, key_hint: str, value: str, used: set[str]) -> str:
@@ -601,9 +640,14 @@ def build_backup_manifest(
     excludes: list[str] | None = None,
 ) -> BackupManifest:
     profile = get_profile(profile_name)
+    if profile.name == "hermes-agent" and (agent_name or agent_path):
+        raise PlannerError("Hermes backups are root-scoped; do not pass --agent-name or --agent-path")
     if backup_mode not in BACKUP_MODES:
         raise PlannerError(f"Unknown backup mode: {backup_mode}")
     excludes = excludes or []
+    warnings: list[str] = []
+    if profile.name == "hermes-agent":
+        warnings.extend(_hermes_access_warnings(root))
 
     selected_agent_roots = [] if backup_mode in {"all", "config", "slim"} else discover_agent_paths(root, agent_name=agent_name, agent_path=agent_path)
     if backup_mode == "selected" and agent_name and not selected_agent_roots:
@@ -640,10 +684,7 @@ def build_backup_manifest(
         source_roots.extend(_selected_scoped_roots(root, profile, _agent_names_for_paths(root, selected_agent_roots)))
 
     for source_root in source_roots:
-        if source_root.is_file():
-            candidates = [source_root]
-        else:
-            candidates = [item for item in sorted(source_root.rglob("*")) if item.is_file()]
+        candidates = _safe_file_candidates(source_root, root, warnings)
         for candidate in candidates:
             resolved = candidate.resolve()
             if resolved in seen:
@@ -681,6 +722,7 @@ def build_backup_manifest(
         file_count=len(planned_files),
         categories=category_counts,
         files=planned_files,
+        warnings=warnings,
     )
 
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from .core import (
     CANONICAL_PROFILES,
     PROFILES,
+    PlannerError,
     apply_secrets,
     backup,
     build_backup_manifest,
@@ -188,6 +189,10 @@ def _format_plan_summary(manifest) -> str:
     ]
     for category, count in sorted(manifest.categories.items()):
         lines.append(f"  {category}: {count}")
+    if manifest.warnings:
+        lines.extend(["", "warnings:"])
+        for warning in manifest.warnings:
+            lines.append(f"  - {warning}")
 
     lines.extend(["", f"sample_files (first {PLAN_SAMPLE_LIMIT} per category):"])
     by_category: dict[str, list] = {}
@@ -306,8 +311,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  python3 -m agent_brain_transplant list-agents --profile openclaw\n"
             "  python3 -m agent_brain_transplant agent-info --profile openclaw --agent-name suyu_code_it\n"
-            "  python3 -m agent_brain_transplant backup --profile hermes-agent --agent-name worker --out-dir ./out/worker\n"
-            "  python3 -m agent_brain_transplant backup-slim --profile openclaw --agent-name suyu_code_it --out-dir ./out/slim\n"
+            "  python3 -m agent_brain_transplant backup --profile hermes-agent --out-dir ./out/hermes-root\n"
+            "  python3 -m agent_brain_transplant backup-slim --profile openclaw --out-dir ./out/slim\n"
             "  python3 -m agent_brain_transplant restore-public --bundle-dir ./out/worker/public_bundle --target-root /tmp/new-agent\n"
             "  python3 -m agent_brain_transplant apply-secrets --secrets-file ./out/worker/private_secrets.json --target-root /tmp/new-agent"
         ),
@@ -418,29 +423,35 @@ def main() -> int:
 
     if args.command == "plan-backup":
         root = _source_root_for(args.profile, args.source_root)
-        manifest = build_backup_manifest(
-            root,
-            args.profile,
-            agent_name=args.agent_name,
-            agent_path=args.agent_path,
-            backup_mode=args.backup_mode,
-            excludes=args.exclude,
-        )
+        try:
+            manifest = build_backup_manifest(
+                root,
+                args.profile,
+                agent_name=args.agent_name,
+                agent_path=args.agent_path,
+                backup_mode=args.backup_mode,
+                excludes=args.exclude,
+            )
+        except PlannerError as error:
+            parser.error(str(error))
         print(_format_plan_summary(manifest))
         return 0
 
     if args.command in {"backup", "backup-all", "backup-slim", "backup-config"}:
-        result = backup(
-            _source_root_for(args.profile, args.source_root),
-            args.profile,
-            Path(args.out_dir),
-            agent_name=getattr(args, "agent_name", None),
-            agent_path=getattr(args, "agent_path", None),
-            backup_mode=args.backup_mode,
-            excludes=args.exclude,
-            dry_run=args.dry_run,
-            force=args.force,
-        )
+        try:
+            result = backup(
+                _source_root_for(args.profile, args.source_root),
+                args.profile,
+                Path(args.out_dir),
+                agent_name=getattr(args, "agent_name", None),
+                agent_path=getattr(args, "agent_path", None),
+                backup_mode=args.backup_mode,
+                excludes=args.exclude,
+                dry_run=args.dry_run,
+                force=args.force,
+            )
+        except PlannerError as error:
+            parser.error(str(error))
         if args.dry_run:
             print(_format_plan_summary(result.manifest))
         else:
@@ -450,6 +461,7 @@ def main() -> int:
                         "out_dir": str(Path(args.out_dir).expanduser()),
                         "file_count": result.manifest.file_count,
                         "secret_count": len(result.secrets),
+                        "warnings": result.manifest.warnings,
                     },
                     indent=2,
                 )

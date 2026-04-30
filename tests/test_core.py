@@ -7,6 +7,7 @@ from unittest import mock
 from pathlib import Path
 
 from agent_brain_transplant.core import (
+    PlannerError,
     apply_secrets,
     backup,
     build_backup_manifest,
@@ -39,6 +40,31 @@ class CoreTests(unittest.TestCase):
             self.assertIn("value", meta)
             self.assertIn("path", meta)
             self.assertIn("key_hint", meta)
+
+    def test_mask_text_extracts_messaging_ids_and_allowlists(self):
+        secrets = {}
+        text = "\n".join(
+            [
+                "FEISHU_OPEN_ID=ou_private",
+                "TELEGRAM_USER_ID=123456",
+                "telegram_group_id=-10098765",
+                "id_allowlist=123,456,789",
+                "allowed_user_ids: 42,84",
+                "allowFrom: personal-source",
+                "appId: cli_app_id",
+            ]
+        )
+        masked, changed = mask_text(text, ".env", secrets)
+        self.assertTrue(changed)
+        self.assertEqual(len(secrets), 7)
+        self.assertIn("__ABT_SECRET_", masked)
+        for value in ("ou_private", "123456", "-10098765", "123,456,789", "42,84", "personal-source", "cli_app_id"):
+            self.assertNotIn(value, masked)
+        stored_values = {entry["value"] for entry in secrets.values()}
+        self.assertIn("ou_private", stored_values)
+        self.assertIn("-10098765", stored_values)
+        self.assertIn("personal-source", stored_values)
+        self.assertIn("cli_app_id", stored_values)
 
     def test_build_backup_manifest_includes_platform_agent_and_work(self):
         with tempfile.TemporaryDirectory() as td:
@@ -84,6 +110,7 @@ class CoreTests(unittest.TestCase):
             (root / "agents" / "a1").mkdir(parents=True)
             (root / "memory").mkdir(parents=True)
             (root / "openclaw.json").write_text('{"token": "123", "model": "x"}', encoding="utf-8")
+            (root / ".env").write_text("API_KEY=env-secret\nSAFE_VALUE=ok\n", encoding="utf-8")
             (root / "agents" / "a1" / "SOUL.md").write_text("password=abc", encoding="utf-8")
             (root / "agents" / "a1" / "chat_session_1.json").write_text("{}", encoding="utf-8")
             (root / "agents" / "a1" / "sessions" / "current.md").parent.mkdir(parents=True)
@@ -95,9 +122,15 @@ class CoreTests(unittest.TestCase):
 
             out = Path(td) / "out"
             result = backup(root, "openclaw", out, agent_name="a1")
-            self.assertEqual(result.manifest.file_count, 3)
+            self.assertEqual(result.manifest.file_count, 4)
             self.assertTrue((out / "manifest.json").exists())
             self.assertTrue((out / "private_secrets.json").exists())
+            self.assertIn(".env", {item.relative for item in result.manifest.files})
+            masked_env = (out / "public_bundle" / ".env").read_text(encoding="utf-8")
+            self.assertIn("__ABT_SECRET_", masked_env)
+            self.assertNotIn("env-secret", masked_env)
+            private_secrets = json.loads((out / "private_secrets.json").read_text(encoding="utf-8"))
+            self.assertTrue(any(secret["path"] == ".env" and secret["value"] == "env-secret" for secret in private_secrets.values()))
             self.assertFalse((out / "public_bundle" / "agents" / "a1" / "chat_session_1.json").exists())
             self.assertFalse((out / "public_bundle" / "agents" / "a1" / "sessions" / "current.md").exists())
             self.assertFalse((out / "public_bundle" / "memory" / "past_sessions" / "old-1.json").exists())
@@ -119,6 +152,8 @@ class CoreTests(unittest.TestCase):
             self.assertIn('123', restored)
             soul = (target / "agents" / "a1" / "SOUL.md").read_text(encoding="utf-8")
             self.assertIn("password=abc", soul)
+            env = (target / ".env").read_text(encoding="utf-8")
+            self.assertIn("API_KEY=env-secret", env)
 
     def test_backup_manifest_compacts_deep_workspace_paths(self):
         with tempfile.TemporaryDirectory() as td:
@@ -397,10 +432,22 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "hermes-agent.json").write_text('token="abc"', encoding="utf-8")
-            (root / "agents" / "worker").mkdir(parents=True)
-            manifest = build_backup_manifest(root, "hermes-agent", agent_name="worker")
+            (root / "SOUL.md").write_text("soul", encoding="utf-8")
+            (root / ".env").write_text("TOKEN=hermes-env-secret\n", encoding="utf-8")
+            manifest = build_backup_manifest(root, "hermes-agent")
             self.assertEqual(manifest.profile, "hermes-agent")
             self.assertGreaterEqual(manifest.categories["platform"], 1)
+            relatives = {item.relative for item in manifest.files}
+            self.assertIn("SOUL.md", relatives)
+            self.assertIn(".env", relatives)
+            self.assertTrue(any("memory" in warning for warning in manifest.warnings))
+
+    def test_hermes_rejects_agent_selector(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "hermes-agent.json").write_text("{}", encoding="utf-8")
+            with self.assertRaises(PlannerError):
+                build_backup_manifest(root, "hermes-agent", agent_name="worker")
 
 
 if __name__ == "__main__":

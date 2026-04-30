@@ -126,9 +126,10 @@ python3 -m agent_brain_transplant apply-secrets \
 ```bash
 python3 -m agent_brain_transplant backup \
   --profile hermes-agent \
-  --agent-name worker \
   --out-dir ./out/hermes-worker
 ```
+
+Hermes backups are root-scoped. Do not pass `--agent-name` or `--agent-path`; root `SOUL.md` is included when present. If Hermes Docker permissions prevent reading persistent roots such as `memory/`, `skills/`, `workspace/`, or `crons/`, the backup plan reports warnings.
 
 `--source-root` is optional for source commands:
 
@@ -162,6 +163,12 @@ For text-like files, the tool looks for sensitive-looking keys such as:
 - `client_secret`
 - `chat_id`
 - `account_id`
+- `feishu`
+- `telegram`
+- `allowlist`
+- `allowFrom`
+- `appId`
+- `group_id`
 
 Matching values are replaced with placeholders like:
 
@@ -170,6 +177,8 @@ __ABT_SECRET_password_a1b2c3d4e5__
 ```
 
 Real values are stored in `private_secrets.json` with path and key-hint metadata.
+
+Root `.env` files are included for both OpenClaw and Hermes profiles. They are copied into the public bundle with sensitive values masked, and the real values are stored in `private_secrets.json` for `apply-secrets`.
 
 Binary files are copied as-is.
 
