@@ -160,10 +160,26 @@ def _format_agent_info(info) -> str:
     return "\n".join(lines)
 
 
+def _compact_workspace_display(relative: str) -> str:
+    path = Path(relative)
+    if path.parts and (path.parts[0] == "workspace" or path.parts[0].startswith("workspace-")) and len(path.parts) > 3:
+        return str(Path(*path.parts[:3]) / "...")
+    return relative
+
+
+def _compact_depth_display(relative: str, depth: int = 2) -> str:
+    path = Path(relative)
+    if len(path.parts) <= depth:
+        return relative
+    return str(Path(*path.parts[:depth]) / "...")
+
+
 def _format_plan_summary(manifest) -> str:
     lines = [
         f"profile: {manifest.profile}",
         f"source_root: {manifest.source_root}",
+        f"backup_mode: {manifest.backup_mode}",
+        f"excludes: {', '.join(manifest.excludes) if manifest.excludes else '-'}",
         f"selected_agent_name: {manifest.selected_agent_name or '-'}",
         f"selected_agent_path: {manifest.selected_agent_path or '-'}",
         f"file_count: {manifest.file_count}",
@@ -180,13 +196,49 @@ def _format_plan_summary(manifest) -> str:
     for category in sorted(by_category):
         files = by_category[category]
         lines.append(f"  {category} ({len(files)} files):")
-        for file_plan in files[:PLAN_SAMPLE_LIMIT]:
+        display_items = []
+        seen_display = set()
+        for file_plan in files:
+            display_relative = _compact_workspace_display(file_plan.relative)
+            if display_relative in seen_display:
+                continue
+            seen_display.add(display_relative)
+            display_items.append((display_relative, file_plan))
+        for display_relative, file_plan in display_items[:PLAN_SAMPLE_LIMIT]:
             masked = "masked" if file_plan.masked else "raw"
-            lines.append(f"    - {file_plan.relative} [{masked}]")
-        remaining = len(files) - PLAN_SAMPLE_LIMIT
+            lines.append(f"    - {display_relative} [{masked}]")
+        remaining = len(display_items) - PLAN_SAMPLE_LIMIT
         if remaining > 0:
             lines.append(f"    ... {remaining} more")
     return "\n".join(lines)
+
+
+def _format_restore_plan(plan) -> str:
+    copied = []
+    seen = set()
+    for relative in plan.copied_files:
+        display = _compact_depth_display(relative)
+        if display in seen:
+            continue
+        seen.add(display)
+        copied.append(display)
+    skipped = []
+    seen_skipped = set()
+    for relative in plan.skipped_files:
+        display = _compact_depth_display(relative)
+        if display in seen_skipped:
+            continue
+        seen_skipped.add(display)
+        skipped.append(display)
+    return json.dumps(
+        {
+            "copied_count": len(plan.copied_files),
+            "copied_paths": copied,
+            "skipped_count": len(plan.skipped_files),
+            "skipped_paths": skipped,
+        },
+        indent=2,
+    )
 
 
 def _add_common_source_args(parser: argparse.ArgumentParser) -> None:
@@ -200,6 +252,9 @@ def _add_common_source_args(parser: argparse.ArgumentParser) -> None:
         "--source-root",
         help="Root directory of the source setup. Defaults to ~/.openclaw for openclaw, ~/.hermes for hermes/hermes-agent",
     )
+
+
+def _add_agent_selector_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--agent-name",
         help="Select a named agent/workspace under the source root, e.g. suyu_code_it",
@@ -208,6 +263,36 @@ def _add_common_source_args(parser: argparse.ArgumentParser) -> None:
         "--agent-path",
         help="Select a specific agent/workspace path relative to the source root or absolute",
     )
+
+
+def _add_exclude_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Exclude a source-root-relative file/folder/glob. Can be repeated. workspace/foo also matches foo inside agent workspace roots.",
+    )
+
+
+def _add_backup_command(
+    sub,
+    name: str,
+    *,
+    mode: str,
+    help_text: str,
+    description: str,
+    include_agent_selector: bool = True,
+) -> argparse.ArgumentParser:
+    command_parser = sub.add_parser(name, help=help_text, description=description)
+    _add_common_source_args(command_parser)
+    if include_agent_selector:
+        _add_agent_selector_args(command_parser)
+    _add_exclude_arg(command_parser)
+    command_parser.add_argument("--out-dir", required=True, help="Destination directory for public bundle, manifest, and private secrets file")
+    command_parser.add_argument("--dry-run", action="store_true", help="Print the backup manifest without writing output files")
+    command_parser.add_argument("--force", action="store_true", help="Allow replacing an existing output directory")
+    command_parser.set_defaults(backup_mode=mode)
+    return command_parser
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -222,6 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python3 -m agent_brain_transplant list-agents --profile openclaw\n"
             "  python3 -m agent_brain_transplant agent-info --profile openclaw --agent-name suyu_code_it\n"
             "  python3 -m agent_brain_transplant backup --profile hermes-agent --agent-name worker --out-dir ./out/worker\n"
+            "  python3 -m agent_brain_transplant backup-slim --profile openclaw --agent-name suyu_code_it --out-dir ./out/slim\n"
             "  python3 -m agent_brain_transplant restore-public --bundle-dir ./out/worker/public_bundle --target-root /tmp/new-agent\n"
             "  python3 -m agent_brain_transplant apply-secrets --secrets-file ./out/worker/private_secrets.json --target-root /tmp/new-agent"
         ),
@@ -243,35 +329,61 @@ def build_parser() -> argparse.ArgumentParser:
         description="Show detailed info for one detected agent/workspace, including state, session count, storage size, and skills.",
     )
     _add_common_source_args(info_parser)
+    _add_agent_selector_args(info_parser)
 
     plan_parser = sub.add_parser(
         "plan-backup",
         help="Show what would be included in a backup",
-        description="Inspect the selected source and print a backup manifest without writing files.",
+        description="Inspect the selected-source backup scope and print a manifest without writing files.",
     )
     _add_common_source_args(plan_parser)
+    _add_agent_selector_args(plan_parser)
+    _add_exclude_arg(plan_parser)
+    plan_parser.set_defaults(backup_mode="selected")
 
-    backup_parser = sub.add_parser(
+    _add_backup_command(
+        sub,
         "backup",
-        help="Create public bundle + private secrets file",
+        mode="selected",
+        help_text="Create selected-agent public bundle + private secrets file",
         description=(
-            "Create a masked public bundle plus a separate private_secrets.json file. "
+            "Create a selected-agent masked public bundle plus a separate private_secrets.json file. "
             "Use --dry-run first if you want to preview the file plan."
         ),
     )
-    _add_common_source_args(backup_parser)
-    backup_parser.add_argument("--out-dir", required=True, help="Destination directory for public bundle, manifest, and private secrets file")
-    backup_parser.add_argument("--dry-run", action="store_true", help="Print the backup manifest without writing output files")
-    backup_parser.add_argument("--force", action="store_true", help="Allow replacing an existing output directory")
+    _add_backup_command(
+        sub,
+        "backup-all",
+        mode="all",
+        help_text="Create backup for all detected agents and shared persistent roots",
+        description="Create a backup for all detected agents plus shared memory, skills, notes, projects, artifacts, and workspaces.",
+        include_agent_selector=False,
+    )
+    _add_backup_command(
+        sub,
+        "backup-slim",
+        mode="slim",
+        help_text="Create all-agents slim backup without large workspace files",
+        description="Create an all-agents slim backup that keeps memory, skills, and markdown files from individual agent workspaces.",
+        include_agent_selector=False,
+    )
+    _add_backup_command(
+        sub,
+        "backup-config",
+        mode="config",
+        help_text="Create config-only backup",
+        description="Create a config-only backup with general platform/config/model settings; no agents, memory, skills, or workspace files.",
+        include_agent_selector=False,
+    )
 
     restore_parser = sub.add_parser(
         "restore-public",
         help="Copy the masked public bundle into a target root",
-        description="Restore the masked public bundle into a target root. Overwrites are refused unless --force is set.",
+        description="Restore the masked public bundle into a target root. Output paths are summarized at depth 2. Overwrites are refused unless --force is set.",
     )
     restore_parser.add_argument("--bundle-dir", required=True, help="Path to the public_bundle directory")
     restore_parser.add_argument("--target-root", required=True, help="Target root where the public bundle should be restored")
-    restore_parser.add_argument("--dry-run", action="store_true", help="Show which files would be copied")
+    restore_parser.add_argument("--dry-run", action="store_true", help="Show a compact summary of which files would be copied")
     restore_parser.add_argument("--force", action="store_true", help="Allow overwriting existing files in the target root")
 
     secrets_parser = sub.add_parser(
@@ -311,17 +423,21 @@ def main() -> int:
             args.profile,
             agent_name=args.agent_name,
             agent_path=args.agent_path,
+            backup_mode=args.backup_mode,
+            excludes=args.exclude,
         )
         print(_format_plan_summary(manifest))
         return 0
 
-    if args.command == "backup":
+    if args.command in {"backup", "backup-all", "backup-slim", "backup-config"}:
         result = backup(
             _source_root_for(args.profile, args.source_root),
             args.profile,
             Path(args.out_dir),
-            agent_name=args.agent_name,
-            agent_path=args.agent_path,
+            agent_name=getattr(args, "agent_name", None),
+            agent_path=getattr(args, "agent_path", None),
+            backup_mode=args.backup_mode,
+            excludes=args.exclude,
             dry_run=args.dry_run,
             force=args.force,
         )
@@ -347,7 +463,7 @@ def main() -> int:
             dry_run=args.dry_run,
             force=args.force,
         )
-        print(json.dumps({"copied_files": plan.copied_files, "skipped_files": plan.skipped_files}, indent=2))
+        print(_format_restore_plan(plan))
         return 0
 
     if args.command == "apply-secrets":

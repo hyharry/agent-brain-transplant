@@ -18,8 +18,12 @@ The tool is meant to make agent setups portable without mixing ordinary project/
   - inferred total session count
   - workspace storage size
   - skills
-  - core agent files present
 - create a masked public backup bundle
+  - default backup scope is the selected agent/workspace plus selected-agent memory/skills/work
+  - `backup-config` backs up only general platform/config/model settings
+  - `backup-all` backs up all detected agents and shared persistent roots
+  - `backup-slim` backs up all agents but keeps only memory, skills, and markdown files from each agent workspace
+  - `--exclude` can be repeated to omit source-root-relative files, folders, or globs
 - store secrets in a separate private file
 - restore in two steps
   - `restore-public`
@@ -47,6 +51,9 @@ Main commands:
 - `agent-info`
 - `plan-backup`
 - `backup`
+- `backup-all`
+- `backup-slim`
+- `backup-config`
 - `restore-public`
 - `apply-secrets`
 
@@ -84,10 +91,18 @@ python3 -m agent_brain_transplant backup \
   --out-dir ./out/demo-backup
 ```
 
+Backup scope commands:
+
+- `backup`: selected agent/workspace plus selected-agent memory/skills/work
+- `backup-config`: only general settings and model/config files; no agents, memory, skills, or workspace
+- `backup-all`: all detected agents plus shared memory, skills, notes, projects, artifacts, and workspaces
+- `backup-slim`: all agents, but only memory, skills, and markdown files from each individual agent workspace
+- `--exclude PATTERN`: omit a file, folder, or glob; repeat as needed. `--exclude workspace/agent_code` also matches `agent_code` inside agent workspace roots such as `workspace-yu-code/agent_code`.
+
 This writes:
 
 - `out/demo-backup/public_bundle/` — masked files suitable for broader sync
-- `out/demo-backup/manifest.json` — file plan and manifest
+- `out/demo-backup/manifest.json` — compact backup manifest; deep workspace paths are summarized after depth 2
 - `out/demo-backup/private_secrets.json` — sensitive values for separate sync
 
 ### Restore public content on a new machine/root

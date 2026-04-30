@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import re
 import shutil
@@ -32,6 +33,9 @@ TEXT_SUFFIXES = {
     ".xml",
     ".csv",
 }
+SLIM_SUFFIXES = {".md", ".markdown"}
+BACKUP_MODES = {"selected", "all", "config", "slim"}
+CONFIG_NAME_RE = re.compile(r".*(config|setting|settings|model|models).*", re.IGNORECASE)
 
 LINE_SECRET_RE = re.compile(
     r"(?im)^([ \t\"']*[A-Za-z0-9_.-]*?(?:token|secret|password|passwd|oauth|api[_-]?key|client[_-]?id|client[_-]?secret|webhook|session|auth|chat_id|account_id|open_id|user_id|union_id)[A-Za-z0-9_.-]*[ \t\"']*)([:=])([ \t]*)([^\n#]+)"
@@ -43,6 +47,8 @@ SESSION_FILE_RE = re.compile(r".*(session|conversation|transcript|chat).*\.(json
 SESSION_DIR_NAMES = {
     "session",
     "sessions",
+    "chat_session",
+    "chat_sessions",
     "current",
     "current_sessions",
     "past",
@@ -109,21 +115,25 @@ class FilePlan:
 class BackupManifest:
     profile: str
     source_root: str
+    backup_mode: str
+    excludes: list[str]
     selected_agent_name: str | None
     selected_agent_path: str | None
     file_count: int
     categories: dict[str, int]
     files: list[FilePlan]
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, compact_workspace: bool = True) -> dict:
         return {
             "profile": self.profile,
             "source_root": self.source_root,
+            "backup_mode": self.backup_mode,
+            "excludes": self.excludes,
             "selected_agent_name": self.selected_agent_name,
             "selected_agent_path": self.selected_agent_path,
             "file_count": self.file_count,
             "categories": self.categories,
-            "files": [asdict(item) for item in self.files],
+            "files": _manifest_file_entries(self.files, compact_workspace=compact_workspace),
         }
 
 
@@ -165,6 +175,43 @@ class PlannerError(ValueError):
     pass
 
 
+def _is_workspace_relative(relative: Path) -> bool:
+    return bool(relative.parts and (relative.parts[0] == "workspace" or relative.parts[0].startswith("workspace-")))
+
+
+def _workspace_manifest_relative(relative: str) -> tuple[str, bool]:
+    path = Path(relative)
+    if not _is_workspace_relative(path) or len(path.parts) <= 3:
+        return relative, False
+    return str(Path(*path.parts[:3]) / "..."), True
+
+
+def _manifest_file_entries(files: list[FilePlan], *, compact_workspace: bool) -> list[dict]:
+    if not compact_workspace:
+        return [asdict(item) for item in files]
+
+    entries: list[dict] = []
+    grouped: dict[str, dict] = {}
+    for item in files:
+        relative, summarized = _workspace_manifest_relative(item.relative)
+        if not summarized:
+            entries.append(asdict(item))
+            continue
+        group = grouped.setdefault(
+            relative,
+            {
+                "relative": relative,
+                "category": item.category,
+                "text_mode": None,
+                "masked": None,
+                "summarized": True,
+                "file_count": 0,
+            },
+        )
+        group["file_count"] += 1
+    return entries + [grouped[key] for key in sorted(grouped)]
+
+
 def normalize_profile_name(profile_name: str) -> str:
     try:
         return PROFILES[profile_name].name
@@ -189,6 +236,53 @@ def _iter_existing_roots(root: Path, patterns: list[str]) -> Iterator[Path]:
                 yield candidate
 
 
+def _root_config_files(root: Path, profile: Profile) -> list[Path]:
+    files: list[Path] = []
+    for file_name in profile.platform_files:
+        candidate = root / file_name
+        if candidate.exists() and candidate.is_file():
+            files.append(candidate)
+    for candidate in sorted(root.iterdir()) if root.exists() else []:
+        if not candidate.is_file():
+            continue
+        if candidate.name in profile.platform_files:
+            continue
+        if candidate.suffix.lower() in TEXT_SUFFIXES and CONFIG_NAME_RE.match(candidate.stem):
+            files.append(candidate)
+    return files
+
+
+def _workspace_roots(root: Path) -> list[Path]:
+    roots: list[Path] = []
+    workspace = root / "workspace"
+    if workspace.exists() and workspace.is_dir():
+        roots.append(workspace)
+    roots.extend(path for path in sorted(root.glob("workspace-*")) if path.is_dir())
+    return roots
+
+
+def _agent_workspace_roots(root: Path, agent_names: list[str]) -> list[Path]:
+    roots: list[Path] = []
+    for name in agent_names:
+        for candidate in _workspace_candidates(root, name):
+            if candidate.exists() and candidate.is_dir() and candidate not in roots:
+                roots.append(candidate)
+    return roots
+
+
+def _selected_scoped_roots(root: Path, profile: Profile, agent_names: list[str]) -> list[Path]:
+    roots: list[Path] = []
+    for shared_root in profile.shared_roots + profile.work_roots:
+        base = root / shared_root
+        if not base.exists() or not base.is_dir():
+            continue
+        for name in agent_names:
+            for candidate in (base / name, base / f"workspace-{name}"):
+                if candidate.exists():
+                    roots.append(candidate)
+    return roots
+
+
 def discover_agent_paths(root: Path, agent_name: str | None = None, agent_path: str | None = None) -> list[Path]:
     found: list[Path] = []
     if agent_path:
@@ -206,9 +300,10 @@ def discover_agent_paths(root: Path, agent_name: str | None = None, agent_path: 
         root / "agents" / agent_name,
         root / agent_name,
         root / "workspace" / agent_name,
-        root / "workspace",
         root / f"workspace-{agent_name}",
     ]
+    if agent_name == "main":
+        explicit_candidates.append(root / "workspace")
     for candidate in explicit_candidates:
         if candidate.exists() and candidate not in found:
             found.append(candidate)
@@ -256,9 +351,8 @@ def _workspace_candidates(root: Path, name: str) -> list[Path]:
         root / f"workspace-{name}",
         root / "workspace" / name,
     ]
-    workspace_root = root / "workspace"
-    if workspace_root.exists():
-        candidates.append(workspace_root)
+    if name == "main":
+        candidates.append(root / "workspace")
     return candidates
 
 
@@ -273,6 +367,19 @@ def _workspace_path_for(root: Path, agent_path: Path, name: str) -> Path | None:
         if candidate.exists() and candidate.is_dir():
             return candidate
     return None
+
+
+def _agent_names_for_paths(root: Path, paths: list[Path]) -> list[str]:
+    names: list[str] = []
+    for path in paths:
+        name = _agent_name_from_path(root, path)
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _all_agent_names(root: Path) -> list[str]:
+    return _agent_names_for_paths(root, list_agent_paths(root))
 
 
 def classify_relative_path(relative: Path, profile: Profile, selected_agent_roots: list[Path], root: Path) -> str:
@@ -379,15 +486,73 @@ def _session_count(agent_path: Path) -> int:
     return count
 
 
+def _path_parts(path: Path, base_path: Path) -> tuple[str, ...]:
+    try:
+        relative = path.relative_to(base_path)
+    except ValueError:
+        relative = Path(path.name)
+    return tuple(part.lower() for part in relative.parts)
+
+
+def _is_session_path(path: Path, base_path: Path) -> bool:
+    parts = _path_parts(path, base_path)
+    if not parts:
+        return False
+    parent_names = set(parts[:-1])
+    return bool(parts[-1] in SESSION_DIR_NAMES or parent_names & SESSION_DIR_NAMES or SESSION_FILE_RE.match(parts[-1]))
+
+
+def _relative_string(path: Path, root: Path) -> str:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = Path("external") / path.name
+    return relative.as_posix()
+
+
+def _is_excluded(relative: str, excludes: list[str]) -> bool:
+    relative = relative.strip("/")
+    relative_parts = relative.split("/") if relative else []
+    for pattern in excludes:
+        normalized = pattern.strip().strip("/")
+        if not normalized:
+            continue
+        if relative == normalized or relative.startswith(f"{normalized}/"):
+            return True
+        if fnmatch.fnmatch(relative, normalized) or fnmatch.fnmatch(Path(relative).name, normalized):
+            return True
+        pattern_parts = normalized.split("/")
+        if (
+            len(pattern_parts) >= 2
+            and pattern_parts[0] == "workspace"
+            and relative_parts
+            and (relative_parts[0] == "workspace" or relative_parts[0].startswith("workspace-"))
+        ):
+            workspace_relative = "/".join(relative_parts[1:])
+            pattern_relative = "/".join(pattern_parts[1:])
+            if workspace_relative == pattern_relative or workspace_relative.startswith(f"{pattern_relative}/"):
+                return True
+            if len(relative_parts) >= 3:
+                named_workspace_relative = "/".join(relative_parts[2:])
+                if named_workspace_relative == pattern_relative or named_workspace_relative.startswith(f"{pattern_relative}/"):
+                    return True
+    return False
+
+
+def _is_slim_file(relative: Path) -> bool:
+    if not relative.parts:
+        return False
+    if relative.parts[0] in {"memory", "skills"}:
+        return True
+    if "memory" in relative.parts or "skills" in relative.parts:
+        return True
+    return relative.suffix.lower() in SLIM_SUFFIXES
+
+
 def _is_session_record(file_path: Path, base_path: Path) -> bool:
     if not file_path.is_file() or file_path.suffix.lower() not in {".json", ".jsonl"}:
         return False
-    try:
-        relative = file_path.relative_to(base_path)
-    except ValueError:
-        relative = Path(file_path.name)
-    parent_names = {part.lower() for part in relative.parts[:-1]}
-    return bool(SESSION_FILE_RE.match(file_path.name) or parent_names & SESSION_DIR_NAMES)
+    return _is_session_path(file_path, base_path)
 
 
 def _skill_names(agent_path: Path) -> list[str]:
@@ -432,20 +597,47 @@ def build_backup_manifest(
     profile_name: str,
     agent_name: str | None = None,
     agent_path: str | None = None,
+    backup_mode: str = "selected",
+    excludes: list[str] | None = None,
 ) -> BackupManifest:
     profile = get_profile(profile_name)
-    selected_agent_roots = discover_agent_paths(root, agent_name=agent_name, agent_path=agent_path)
-    if agent_name and not selected_agent_roots:
+    if backup_mode not in BACKUP_MODES:
+        raise PlannerError(f"Unknown backup mode: {backup_mode}")
+    excludes = excludes or []
+
+    selected_agent_roots = [] if backup_mode in {"all", "config", "slim"} else discover_agent_paths(root, agent_name=agent_name, agent_path=agent_path)
+    if backup_mode == "selected" and agent_name and not selected_agent_roots:
         raise PlannerError(f"Could not find agent '{agent_name}' under {root}")
-    if agent_path and not selected_agent_roots:
+    if backup_mode == "selected" and agent_path and not selected_agent_roots:
         raise PlannerError(f"Could not find agent path '{agent_path}' under {root}")
 
     seen: set[Path] = set()
     planned_files: list[FilePlan] = []
     category_counts = {"platform": 0, "agent": 0, "shared": 0, "work": 0}
 
-    source_roots = list(_iter_existing_roots(root, profile.platform_files + profile.shared_roots + profile.work_roots))
-    source_roots.extend(selected_agent_roots)
+    if backup_mode == "config":
+        source_roots = _root_config_files(root, profile)
+    elif backup_mode == "all":
+        source_roots = list(_iter_existing_roots(root, profile.platform_files + profile.shared_roots + profile.work_roots))
+        agents_root = root / "agents"
+        if agents_root.exists():
+            source_roots.append(agents_root)
+        source_roots.extend(_workspace_roots(root))
+    elif backup_mode == "slim":
+        agent_names = _all_agent_names(root)
+        source_roots = list(_root_config_files(root, profile))
+        agents_root = root / "agents"
+        if agents_root.exists():
+            source_roots.append(agents_root)
+        for root_name in ("memory", "skills"):
+            candidate = root / root_name
+            if candidate.exists():
+                source_roots.append(candidate)
+        source_roots.extend(_agent_workspace_roots(root, agent_names))
+    else:
+        source_roots = list(_root_config_files(root, profile))
+        source_roots.extend(selected_agent_roots)
+        source_roots.extend(_selected_scoped_roots(root, profile, _agent_names_for_paths(root, selected_agent_roots)))
 
     for source_root in source_roots:
         if source_root.is_file():
@@ -453,17 +645,20 @@ def build_backup_manifest(
         else:
             candidates = [item for item in sorted(source_root.rglob("*")) if item.is_file()]
         for candidate in candidates:
-            if _is_session_record(candidate, root):
-                continue
             resolved = candidate.resolve()
             if resolved in seen:
                 continue
-            seen.add(resolved)
             try:
                 relative = candidate.relative_to(root)
             except ValueError:
                 relative = Path("external") / candidate.name
+            relative_text = relative.as_posix()
+            if _is_session_path(candidate, root) or _is_excluded(relative_text, excludes):
+                continue
             category = classify_relative_path(relative, profile, selected_agent_roots, root)
+            if backup_mode == "slim" and category != "platform" and not _is_slim_file(relative):
+                continue
+            seen.add(resolved)
             text_mode = is_text_file(candidate)
             planned_files.append(
                 FilePlan(
@@ -479,6 +674,8 @@ def build_backup_manifest(
     return BackupManifest(
         profile=profile.name,
         source_root=str(root),
+        backup_mode=backup_mode,
+        excludes=excludes,
         selected_agent_name=agent_name,
         selected_agent_path=agent_path,
         file_count=len(planned_files),
@@ -498,12 +695,21 @@ def backup(
     out_dir: Path,
     agent_name: str | None = None,
     agent_path: str | None = None,
+    backup_mode: str = "selected",
+    excludes: list[str] | None = None,
     dry_run: bool = False,
     force: bool = False,
 ) -> BackupResult:
     root = root.expanduser().resolve()
     out_dir = out_dir.expanduser().resolve()
-    manifest = build_backup_manifest(root, profile_name, agent_name=agent_name, agent_path=agent_path)
+    manifest = build_backup_manifest(
+        root,
+        profile_name,
+        agent_name=agent_name,
+        agent_path=agent_path,
+        backup_mode=backup_mode,
+        excludes=excludes,
+    )
 
     if dry_run:
         return BackupResult(manifest=manifest, secrets={})

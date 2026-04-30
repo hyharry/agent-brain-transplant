@@ -1,6 +1,9 @@
 import json
+import contextlib
+import io
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from agent_brain_transplant.core import (
@@ -13,7 +16,7 @@ from agent_brain_transplant.core import (
     mask_text,
     restore_public,
 )
-from agent_brain_transplant.cli import _format_agent_info, _format_agent_list
+from agent_brain_transplant.cli import _format_agent_info, _format_agent_list, _format_restore_plan, main
 
 
 class CoreTests(unittest.TestCase):
@@ -43,9 +46,19 @@ class CoreTests(unittest.TestCase):
             (root / "openclaw.json").write_text('token="abc"', encoding="utf-8")
             (root / "agents" / "a1").mkdir(parents=True)
             (root / "agents" / "a1" / "SOUL.md").write_text("hello", encoding="utf-8")
+            (root / "workspace" / "main.md").parent.mkdir(parents=True)
+            (root / "workspace" / "main.md").write_text("main workspace", encoding="utf-8")
+            (root / "workspace-a1" / "agent.md").parent.mkdir(parents=True)
+            (root / "workspace-a1" / "agent.md").write_text("agent workspace", encoding="utf-8")
             (root / "agents" / "a1" / "chat_session_1.json").write_text("{}", encoding="utf-8")
-            (root / "memory").mkdir()
-            (root / "memory" / "today.md").write_text("notes", encoding="utf-8")
+            (root / "agents" / "a1" / "sessions" / "current.md").parent.mkdir(parents=True)
+            (root / "agents" / "a1" / "sessions" / "current.md").write_text("ephemeral", encoding="utf-8")
+            (root / "agents" / "a1" / "chat_sessions" / "trace.log").parent.mkdir(parents=True)
+            (root / "agents" / "a1" / "chat_sessions" / "trace.log").write_text("ephemeral", encoding="utf-8")
+            (root / "memory" / "a1").mkdir(parents=True)
+            (root / "memory" / "a1" / "today.md").write_text("notes", encoding="utf-8")
+            (root / "memory" / "other").mkdir()
+            (root / "memory" / "other" / "today.md").write_text("other notes", encoding="utf-8")
             (root / "memory" / "history").mkdir()
             (root / "memory" / "history" / "old-1.json").write_text("{}", encoding="utf-8")
             manifest = build_backup_manifest(root, "openclaw", agent_name="a1")
@@ -56,7 +69,14 @@ class CoreTests(unittest.TestCase):
             self.assertGreaterEqual(manifest.categories["work"], 1)
             relatives = {item.relative for item in manifest.files}
             self.assertNotIn("agents/a1/chat_session_1.json", relatives)
+            self.assertNotIn("agents/a1/sessions/current.md", relatives)
+            self.assertNotIn("agents/a1/chat_sessions/trace.log", relatives)
             self.assertNotIn("memory/history/old-1.json", relatives)
+            self.assertIn("memory/a1/today.md", relatives)
+            self.assertNotIn("memory/other/today.md", relatives)
+            self.assertIn("workspace-a1/agent.md", relatives)
+            self.assertNotIn("workspace/main.md", relatives)
+            self.assertFalse(any("session" in relative.lower() for relative in relatives))
 
     def test_backup_restore_and_apply_secrets_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:
@@ -66,7 +86,10 @@ class CoreTests(unittest.TestCase):
             (root / "openclaw.json").write_text('{"token": "123", "model": "x"}', encoding="utf-8")
             (root / "agents" / "a1" / "SOUL.md").write_text("password=abc", encoding="utf-8")
             (root / "agents" / "a1" / "chat_session_1.json").write_text("{}", encoding="utf-8")
-            (root / "memory" / "today.md").write_text("normal notes", encoding="utf-8")
+            (root / "agents" / "a1" / "sessions" / "current.md").parent.mkdir(parents=True)
+            (root / "agents" / "a1" / "sessions" / "current.md").write_text("ephemeral", encoding="utf-8")
+            (root / "memory" / "a1").mkdir(parents=True)
+            (root / "memory" / "a1" / "today.md").write_text("normal notes", encoding="utf-8")
             (root / "memory" / "past_sessions").mkdir()
             (root / "memory" / "past_sessions" / "old-1.json").write_text("{}", encoding="utf-8")
 
@@ -76,7 +99,13 @@ class CoreTests(unittest.TestCase):
             self.assertTrue((out / "manifest.json").exists())
             self.assertTrue((out / "private_secrets.json").exists())
             self.assertFalse((out / "public_bundle" / "agents" / "a1" / "chat_session_1.json").exists())
+            self.assertFalse((out / "public_bundle" / "agents" / "a1" / "sessions" / "current.md").exists())
             self.assertFalse((out / "public_bundle" / "memory" / "past_sessions" / "old-1.json").exists())
+            self.assertTrue((out / "public_bundle" / "memory" / "a1" / "today.md").exists())
+            manifest_text = (out / "manifest.json").read_text(encoding="utf-8")
+            self.assertNotIn("chat_session_1.json", manifest_text)
+            self.assertNotIn("sessions/current.md", manifest_text)
+            self.assertNotIn("past_sessions", manifest_text)
 
             target = Path(td) / "target"
             restore_plan = restore_public(out / "public_bundle", target)
@@ -91,6 +120,152 @@ class CoreTests(unittest.TestCase):
             soul = (target / "agents" / "a1" / "SOUL.md").read_text(encoding="utf-8")
             self.assertIn("password=abc", soul)
 
+    def test_backup_manifest_compacts_deep_workspace_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "src"
+            (root / "agents" / "a1").mkdir(parents=True)
+            (root / "agents" / "a1" / "SOUL.md").write_text("hello", encoding="utf-8")
+            deep_file = root / "workspace-a1" / "src" / "pkg" / "deep" / "feature.py"
+            deep_file.parent.mkdir(parents=True)
+            deep_file.write_text("print('kept')", encoding="utf-8")
+
+            out = Path(td) / "out"
+            backup(root, "openclaw", out, agent_name="a1")
+
+            self.assertTrue((out / "public_bundle" / "workspace-a1" / "src" / "pkg" / "deep" / "feature.py").exists())
+            manifest_text = (out / "manifest.json").read_text(encoding="utf-8")
+            self.assertIn("workspace-a1/src/pkg/...", manifest_text)
+            self.assertNotIn("workspace-a1/src/pkg/deep/feature.py", manifest_text)
+
+    def test_backup_config_only_includes_platform_and_model_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "openclaw.json").write_text("{}", encoding="utf-8")
+            (root / "model_settings.json").write_text("{}", encoding="utf-8")
+            (root / "agents" / "a1").mkdir(parents=True)
+            (root / "agents" / "a1" / "SOUL.md").write_text("hello", encoding="utf-8")
+            (root / "memory" / "a1").mkdir(parents=True)
+            (root / "memory" / "a1" / "today.md").write_text("notes", encoding="utf-8")
+            (root / "workspace" / "project.md").parent.mkdir(parents=True)
+            (root / "workspace" / "project.md").write_text("work", encoding="utf-8")
+
+            manifest = build_backup_manifest(root, "openclaw", agent_name="a1", backup_mode="config")
+            relatives = {item.relative for item in manifest.files}
+            self.assertEqual(relatives, {"openclaw.json", "model_settings.json"})
+            self.assertEqual(manifest.backup_mode, "config")
+
+    def test_backup_all_includes_all_agents_and_shared_work(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "openclaw.json").write_text("{}", encoding="utf-8")
+            for name in ("a1", "a2"):
+                (root / "agents" / name).mkdir(parents=True)
+                (root / "agents" / name / "SOUL.md").write_text(name, encoding="utf-8")
+                (root / "memory" / name).mkdir(parents=True)
+                (root / "memory" / name / "today.md").write_text(name, encoding="utf-8")
+
+            manifest = build_backup_manifest(root, "openclaw", backup_mode="all")
+            relatives = {item.relative for item in manifest.files}
+            self.assertIn("agents/a1/SOUL.md", relatives)
+            self.assertIn("agents/a2/SOUL.md", relatives)
+            self.assertIn("memory/a1/today.md", relatives)
+            self.assertIn("memory/a2/today.md", relatives)
+
+    def test_backup_slim_keeps_all_agents_markdown_workspaces_memory_and_skills(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "openclaw.json").write_text("{}", encoding="utf-8")
+            (root / "agents" / "a1").mkdir(parents=True)
+            (root / "agents" / "a1" / "SOUL.md").write_text("hello", encoding="utf-8")
+            (root / "agents" / "a2").mkdir(parents=True)
+            (root / "agents" / "a2" / "SOUL.md").write_text("hello", encoding="utf-8")
+            (root / "workspace" / "main.md").parent.mkdir(parents=True)
+            (root / "workspace" / "main.md").write_text("skip main", encoding="utf-8")
+            (root / "workspace-a1" / "notes.md").parent.mkdir(parents=True)
+            (root / "workspace-a1" / "notes.md").write_text("keep", encoding="utf-8")
+            (root / "workspace-a1" / "data.bin").write_bytes(b"skip")
+            (root / "workspace-a1" / "src" / "feature.py").parent.mkdir(parents=True)
+            (root / "workspace-a1" / "src" / "feature.py").write_text("skip", encoding="utf-8")
+            (root / "workspace-a1" / "src" / "deep.md").write_text("keep", encoding="utf-8")
+            (root / "workspace-a2" / "plan.md").parent.mkdir(parents=True)
+            (root / "workspace-a2" / "plan.md").write_text("keep", encoding="utf-8")
+            (root / "workspace-a2" / "asset.png").write_bytes(b"skip")
+            (root / "memory" / "a1").mkdir(parents=True)
+            (root / "memory" / "a1" / "db.sqlite").write_bytes(b"keep")
+            (root / "memory" / "a2").mkdir(parents=True)
+            (root / "memory" / "a2" / "today.md").write_text("keep", encoding="utf-8")
+            (root / "skills" / "a1" / "demo").mkdir(parents=True)
+            (root / "skills" / "a1" / "demo" / "tool.py").write_text("keep", encoding="utf-8")
+            (root / "skills" / "a2" / "demo").mkdir(parents=True)
+            (root / "skills" / "a2" / "demo" / "SKILL.md").write_text("keep", encoding="utf-8")
+
+            manifest = build_backup_manifest(root, "openclaw", backup_mode="slim")
+            relatives = {item.relative for item in manifest.files}
+            self.assertIn("openclaw.json", relatives)
+            self.assertIn("agents/a1/SOUL.md", relatives)
+            self.assertIn("agents/a2/SOUL.md", relatives)
+            self.assertIn("workspace-a1/notes.md", relatives)
+            self.assertIn("workspace-a1/src/deep.md", relatives)
+            self.assertIn("workspace-a2/plan.md", relatives)
+            self.assertIn("memory/a1/db.sqlite", relatives)
+            self.assertIn("memory/a2/today.md", relatives)
+            self.assertIn("skills/a1/demo/tool.py", relatives)
+            self.assertIn("skills/a2/demo/SKILL.md", relatives)
+            self.assertNotIn("workspace/main.md", relatives)
+            self.assertNotIn("workspace-a1/data.bin", relatives)
+            self.assertNotIn("workspace-a1/src/feature.py", relatives)
+            self.assertNotIn("workspace-a2/asset.png", relatives)
+
+    def test_backup_exclude_filters_files_and_folders(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "openclaw.json").write_text("{}", encoding="utf-8")
+            (root / "agents" / "a1").mkdir(parents=True)
+            (root / "agents" / "a1" / "SOUL.md").write_text("hello", encoding="utf-8")
+            (root / "memory" / "a1").mkdir(parents=True)
+            (root / "memory" / "a1" / "today.md").write_text("notes", encoding="utf-8")
+            (root / "workspace" / "build" / "out.txt").parent.mkdir(parents=True)
+            (root / "workspace" / "build" / "out.txt").write_text("skip", encoding="utf-8")
+            (root / "workspace-a1" / "agent_code" / "main.py").parent.mkdir(parents=True)
+            (root / "workspace-a1" / "agent_code" / "main.py").write_text("skip", encoding="utf-8")
+            (root / "workspace-a1" / "keep" / "main.py").parent.mkdir(parents=True)
+            (root / "workspace-a1" / "keep" / "main.py").write_text("keep", encoding="utf-8")
+            (root / "workspace" / "a1" / "agent_code" / "alt.py").parent.mkdir(parents=True)
+            (root / "workspace" / "a1" / "agent_code" / "alt.py").write_text("skip", encoding="utf-8")
+
+            manifest = build_backup_manifest(root, "openclaw", agent_name="a1", excludes=["memory/a1", "workspace/build", "workspace/agent_code"])
+            relatives = {item.relative for item in manifest.files}
+            self.assertNotIn("memory/a1/today.md", relatives)
+            self.assertNotIn("workspace/build/out.txt", relatives)
+            self.assertNotIn("workspace-a1/agent_code/main.py", relatives)
+            self.assertNotIn("workspace/a1/agent_code/alt.py", relatives)
+            self.assertIn("workspace-a1/keep/main.py", relatives)
+            self.assertIn("agents/a1/SOUL.md", relatives)
+
+    def test_all_agent_backup_commands_do_not_require_agent_selector(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "src"
+            root.mkdir()
+            (root / "openclaw.json").write_text("{}", encoding="utf-8")
+            (root / "agents" / "a1").mkdir(parents=True)
+            (root / "agents" / "a1" / "SOUL.md").write_text("hello", encoding="utf-8")
+            out = Path(td) / "out"
+
+            for command in ("backup-all", "backup-slim", "backup-config"):
+                argv = [
+                    "agent-brain-transplant",
+                    command,
+                    "--profile",
+                    "openclaw",
+                    "--source-root",
+                    str(root),
+                    "--out-dir",
+                    str(out / command),
+                    "--dry-run",
+                ]
+                with mock.patch("sys.argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(), 0)
+
     def test_restore_public_dry_run_does_not_write(self):
         with tempfile.TemporaryDirectory() as td:
             bundle = Path(td) / "bundle"
@@ -100,6 +275,21 @@ class CoreTests(unittest.TestCase):
             plan = restore_public(bundle, target, dry_run=True)
             self.assertIn("agents/x.txt", plan.copied_files)
             self.assertFalse(target.exists())
+
+    def test_restore_output_is_compact(self):
+        with tempfile.TemporaryDirectory() as td:
+            bundle = Path(td) / "bundle"
+            target = Path(td) / "target"
+            deep_file = bundle / "workspace-a1" / "src" / "pkg" / "feature.py"
+            deep_file.parent.mkdir(parents=True)
+            deep_file.write_text("hi", encoding="utf-8")
+
+            plan = restore_public(bundle, target)
+            output = _format_restore_plan(plan)
+            self.assertTrue((target / "workspace-a1" / "src" / "pkg" / "feature.py").exists())
+            self.assertIn('"copied_count": 1', output)
+            self.assertIn("workspace-a1/src/...", output)
+            self.assertNotIn("workspace-a1/src/pkg/feature.py", output)
 
     def test_apply_secrets_dry_run_only_reports(self):
         with tempfile.TemporaryDirectory() as td:
@@ -131,7 +321,7 @@ class CoreTests(unittest.TestCase):
             root = Path(td)
             a1 = root / "agents" / "alpha"
             a1.mkdir(parents=True)
-            workspace = root / "workspace"
+            workspace = root / "workspace-alpha"
             workspace.mkdir()
             (workspace / "project.txt").write_text("workspace data", encoding="utf-8")
             (a1 / "AGENTS.md").write_text("hello", encoding="utf-8")
@@ -170,7 +360,7 @@ class CoreTests(unittest.TestCase):
             root = Path(td)
             agent = root / "agents" / "alpha"
             agent.mkdir(parents=True)
-            workspace = root / "workspace"
+            workspace = root / "workspace-alpha"
             (workspace / "src" / "pkg" / "deep").mkdir(parents=True)
             (workspace / ".git" / "objects").mkdir(parents=True)
             (workspace / "src" / "top.txt").write_text("top", encoding="utf-8")
