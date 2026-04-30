@@ -1,213 +1,117 @@
 # agent-brain-transplant
 
-A small Python CLI for backing up and transplanting an OpenClaw or Hermes-agent setup in two phases:
+Small Python CLI for moving OpenClaw or Hermes-agent state in two parts:
 
-1. **Public phase**: copy platform settings, agent setup, and work files into a masked public bundle.
-2. **Secrets phase**: apply private values from a separate secrets file to make the transplant functional.
+1. `public_bundle/`: files safe to move/share, with secrets masked.
+2. `private_secrets.json`: real secret values, applied later.
 
-The tool is meant to make agent setups portable without mixing ordinary project/config content with tokens, passwords, IDs, OAuth secrets, or similar sensitive values. Chat/session records are treated as ephemeral runtime state and are not backed up.
+Chat/session history is treated as ephemeral runtime state and is not backed up.
 
-## What it can do now
-
-- back up OpenClaw or Hermes-agent roots
-  - includes memory, skills, and work/project files
-  - excludes current and past chat/session records
-- list detected agents/workspaces
-- show per-agent info
-  - state
-  - inferred total session count
-  - workspace storage size
-  - skills
-- create a masked public backup bundle
-  - default backup scope is the selected agent/workspace plus selected-agent memory/skills/work
-  - `backup-config` backs up only general platform/config/model settings
-  - `backup-all` backs up all detected agents and shared persistent roots
-  - `backup-slim` backs up all agents but keeps only memory, skills, and markdown files from each agent workspace
-  - `--exclude` can be repeated to omit source-root-relative files, folders, or globs
-- store secrets in a separate private file
-- restore in two steps
-  - `restore-public`
-  - `apply-secrets`
-- support dry-run planning
-- refuse overwrites by default
-
-## Supported profiles
-
-- `openclaw`
-- `hermes`
-- `hermes-agent`
-
-`hermes` and `hermes-agent` currently map to the same Hermes-agent profile.
-
-## CLI overview
-
-```bash
-python3 -m agent_brain_transplant --help
-```
-
-Main commands:
-
-- `list-agents`
-- `agent-info`
-- `plan-backup`
-- `backup`
-- `backup-all`
-- `backup-slim`
-- `backup-config`
-- `restore-public`
-- `apply-secrets`
-
-## Example usage
-
-### List agents in an OpenClaw root
-
-```bash
-python3 -m agent_brain_transplant list-agents \
-  --profile openclaw
-```
-
-### Show detailed info for one agent
-
-```bash
-python3 -m agent_brain_transplant agent-info \
-  --profile openclaw \
-  --agent-name suyu_code_it
-```
-
-### Preview what would be backed up
-
-```bash
-python3 -m agent_brain_transplant plan-backup \
-  --profile openclaw \
-  --agent-name suyu_code_it
-```
-
-### Create backup bundle
-
-```bash
-python3 -m agent_brain_transplant backup \
-  --profile openclaw \
-  --agent-name suyu_code_it \
-  --out-dir ./out/demo-backup
-```
-
-Backup scope commands:
-
-- `backup`: selected agent/workspace plus selected-agent memory/skills/work
-- `backup-config`: only general settings and model/config files; no agents, memory, skills, or workspace
-- `backup-all`: all detected agents plus shared memory, skills, notes, projects, artifacts, and workspaces
-- `backup-slim`: all agents, but only memory, skills, and markdown files from each individual agent workspace
-- `--exclude PATTERN`: omit a file, folder, or glob; repeat as needed. `--exclude workspace/agent_code` also matches `agent_code` inside agent workspace roots such as `workspace-yu-code/agent_code`.
-
-This writes:
-
-- `out/demo-backup/public_bundle/` — masked files suitable for broader sync
-- `out/demo-backup/manifest.json` — compact backup manifest; deep workspace paths are summarized after depth 2
-- `out/demo-backup/private_secrets.json` — sensitive values for separate sync
-
-### Restore public content on a new machine/root
-
-```bash
-python3 -m agent_brain_transplant restore-public \
-  --bundle-dir ./out/demo-backup/public_bundle \
-  --target-root /tmp/new-openclaw
-```
-
-### Apply secrets into the transplanted copy
-
-```bash
-python3 -m agent_brain_transplant apply-secrets \
-  --secrets-file ./out/demo-backup/private_secrets.json \
-  --target-root /tmp/new-openclaw
-```
-
-### Hermes-agent example
-
-```bash
-python3 -m agent_brain_transplant backup \
-  --profile hermes-agent \
-  --out-dir ./out/hermes-worker
-```
-
-Hermes backups are root-scoped. Do not pass `--agent-name` or `--agent-path`; root `SOUL.md` is included when present. If Hermes Docker permissions prevent reading persistent roots such as `memory/`, `skills/`, `workspace/`, or `crons/`, the backup plan reports warnings.
-
-`--source-root` is optional for source commands:
+## Profiles
 
 - `openclaw` defaults to `~/.openclaw`
 - `hermes` / `hermes-agent` default to `~/.hermes`
 
-## What “agent info” means here
+Hermes backups are root-scoped: do not pass `--agent-name` or `--agent-path`. Root `SOUL.md` and `.env` are included when present. If Docker permissions block `memory/`, `skills/`, `workspace/`, or `crons/`, the plan reports warnings.
 
-The current implementation reports filesystem-inferred metadata:
+## Core Commands
 
-- **state**: inferred from `STATE.md` / `state.md` / `TODO.md` when present
-- **total session count**: count of current and past session-like JSON/JSONL files under the agent/workspace path
-- **workspace storage size**: recursive byte size of the agent/workspace directory
-- **memory size**: recursive byte size of the agent/workspace `memory/` directory when present
-- **skills**: skill directory names under `skills/`
-- **workspace files**: `agent-info` lists files and folders under the selected workspace with human-readable sizes
+```bash
+python3 -m agent_brain_transplant list-agents --profile openclaw
 
-This is intentionally simple and readable. It is not yet runtime/API-aware.
+python3 -m agent_brain_transplant agent-info \
+  --profile openclaw \
+  --agent-name abcd
 
-## Masking behavior
+python3 -m agent_brain_transplant plan-backup \
+  --profile openclaw \
+  --agent-name abcd
+```
 
-For text-like files, the tool looks for sensitive-looking keys such as:
+## Backup
 
-- `token`
-- `secret`
-- `password`
-- `passwd`
-- `oauth`
-- `api_key`
-- `client_id`
-- `client_secret`
-- `chat_id`
-- `account_id`
-- `feishu`
-- `telegram`
-- `allowlist`
-- `allowFrom`
-- `appId`
-- `group_id`
+Selected OpenClaw agent:
 
-Matching values are replaced with placeholders like:
+```bash
+python3 -m agent_brain_transplant backup \
+  --profile openclaw \
+  --agent-name abcd \
+  --out-dir ./out/xxxx-backup
+```
+
+Hermes root:
+
+```bash
+python3 -m agent_brain_transplant backup \
+  --profile hermes-agent \
+  --out-dir ./out/xxxx-hermes
+```
+
+Other backup scopes:
+
+- `backup`: selected agent/workspace plus selected-agent memory/skills/work
+- `backup-all`: all agents and shared persistent roots
+- `backup-slim`: all agents, memory, skills, and only markdown files from each agent workspace
+- `backup-config`: only platform/config/model settings
+
+Useful options:
+
+```bash
+--dry-run
+--force
+--exclude workspace/agent_code
+--exclude '*.sqlite'
+```
+
+`--exclude workspace/agent_code` also matches agent workspace roots such as `workspace-abcd/agent_code`.
+
+## Restore
+
+Restore public files first:
+
+```bash
+python3 -m agent_brain_transplant restore-public \
+  --bundle-dir ./out/xxxx-backup/public_bundle \
+  --target-root /tmp/new-xxxx
+```
+
+Then apply private secrets:
+
+```bash
+python3 -m agent_brain_transplant apply-secrets \
+  --secrets-file ./out/xxxx-backup/private_secrets.json \
+  --target-root /tmp/new-xxxx
+```
+
+`restore-public` refuses overwrites unless `--force` is set.
+
+## Masking
+
+Text files, including root `.env`, are scanned for sensitive keys such as:
+
+```text
+token, secret, password, api_key, client_id, client_secret,
+chat_id, account_id, feishu, telegram, allowlist,
+allowFrom, appId, group_id
+```
+
+Values are replaced with placeholders like:
 
 ```text
 __ABT_SECRET_password_a1b2c3d4e5__
 ```
 
-Real values are stored in `private_secrets.json` with path and key-hint metadata.
+The real values are written to `private_secrets.json`.
 
-Root `.env` files are included for both OpenClaw and Hermes profiles. They are copied into the public bundle with sensitive values masked, and the real values are stored in `private_secrets.json` for `apply-secrets`.
+## Notes
 
-Binary files are copied as-is.
+- `agent-info` is filesystem-inferred: state files, total session count, workspace size, memory size, and skills.
+- `manifest.json` is compact; deep workspace paths are summarized after depth 2.
+- Binary files are copied as-is.
 
-## Verification
-
-Run tests:
+## Verify
 
 ```bash
 python3 -m unittest discover -s tests -v
-```
-
-Show CLI help:
-
-```bash
 python3 -m agent_brain_transplant --help
-python3 -m agent_brain_transplant list-agents --help
-python3 -m agent_brain_transplant agent-info --help
 ```
-
-## Limits of this version
-
-This is still a clean vertical slice, not a full migration engine.
-
-Current limits:
-
-- profile discovery is convention-based, not provider-native introspection
-- state/session info is filesystem-inferred
-- masking is still text-pattern driven rather than schema-aware
-- restore does not perform provider-specific re-link flows
-- include/exclude rules are profile-level rather than user-configurable
-
-Useful next upgrades would be schema-aware secret masking, diffing, include/exclude filters, and provider-native inspection hooks.
