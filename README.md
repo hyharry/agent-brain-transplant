@@ -54,6 +54,15 @@ Other backup scopes:
 - `backup-slim`: all agents, memory, skills, and only markdown files from each agent workspace
 - `backup-config`: only platform/config/model settings
 
+Example for a transplant bundle that keeps the brain but drops old messaging bindings:
+
+```bash
+python3 -m agent_brain_transplant backup-all \
+  --profile openclaw \
+  --ignore-channel \
+  --out-dir ./out/deliver-no-channels
+```
+
 Useful options:
 
 ```bash
@@ -61,9 +70,12 @@ Useful options:
 --force
 --exclude workspace/agent_code
 --exclude '*.sqlite'
+--ignore-channel
 ```
 
 `--exclude workspace/agent_code` also matches agent workspace roots such as `workspace-abcd/agent_code`.
+
+`--ignore-channel` skips channel-related files/config (for example Telegram, WhatsApp, Feishu, Discord, Signal) so you can deliver memory, skills, prompts, and settings into a fresh environment and bind new channels there instead of reusing the old ones.
 
 ## Restore
 

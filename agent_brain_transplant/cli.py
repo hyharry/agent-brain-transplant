@@ -183,6 +183,7 @@ def _format_plan_summary(manifest) -> str:
         f"excludes: {', '.join(manifest.excludes) if manifest.excludes else '-'}",
         f"selected_agent_name: {manifest.selected_agent_name or '-'}",
         f"selected_agent_path: {manifest.selected_agent_path or '-'}",
+        f"ignore_channel: {manifest.ignore_channel}",
         f"file_count: {manifest.file_count}",
         "",
         "categories:",
@@ -279,6 +280,14 @@ def _add_exclude_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_ignore_channel_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--ignore-channel",
+        action="store_true",
+        help="Skip channel-related files/config (Telegram, WhatsApp, Feishu, etc.) so the delivered agent can be wired to fresh channels later.",
+    )
+
+
 def _add_backup_command(
     sub,
     name: str,
@@ -293,6 +302,7 @@ def _add_backup_command(
     if include_agent_selector:
         _add_agent_selector_args(command_parser)
     _add_exclude_arg(command_parser)
+    _add_ignore_channel_arg(command_parser)
     command_parser.add_argument("--out-dir", required=True, help="Destination directory for public bundle, manifest, and private secrets file")
     command_parser.add_argument("--dry-run", action="store_true", help="Print the backup manifest without writing output files")
     command_parser.add_argument("--force", action="store_true", help="Allow replacing an existing output directory")
@@ -344,6 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_source_args(plan_parser)
     _add_agent_selector_args(plan_parser)
     _add_exclude_arg(plan_parser)
+    _add_ignore_channel_arg(plan_parser)
     plan_parser.set_defaults(backup_mode="selected")
 
     _add_backup_command(
@@ -431,6 +442,7 @@ def main() -> int:
                 agent_path=args.agent_path,
                 backup_mode=args.backup_mode,
                 excludes=args.exclude,
+                ignore_channel=args.ignore_channel,
             )
         except PlannerError as error:
             parser.error(str(error))
@@ -447,6 +459,7 @@ def main() -> int:
                 agent_path=getattr(args, "agent_path", None),
                 backup_mode=args.backup_mode,
                 excludes=args.exclude,
+                ignore_channel=args.ignore_channel,
                 dry_run=args.dry_run,
                 force=args.force,
             )

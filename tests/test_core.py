@@ -188,6 +188,7 @@ class CoreTests(unittest.TestCase):
             relatives = {item.relative for item in manifest.files}
             self.assertEqual(relatives, {"openclaw.json", "model_settings.json"})
             self.assertEqual(manifest.backup_mode, "config")
+            self.assertFalse(manifest.ignore_channel)
 
     def test_backup_all_includes_all_agents_and_shared_work(self):
         with tempfile.TemporaryDirectory() as td:
@@ -251,6 +252,37 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("workspace-a1/src/feature.py", relatives)
             self.assertNotIn("workspace-a2/asset.png", relatives)
 
+    def test_ignore_channel_skips_channel_files_and_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "openclaw.json").write_text("{}", encoding="utf-8")
+            (root / "telegram_settings.json").write_text('{"token": "abc"}', encoding="utf-8")
+            (root / "agents" / "a1").mkdir(parents=True)
+            (root / "agents" / "a1" / "SOUL.md").write_text("hello", encoding="utf-8")
+            (root / "memory" / "a1").mkdir(parents=True)
+            (root / "memory" / "a1" / "today.md").write_text("notes", encoding="utf-8")
+            (root / "skills" / "a1" / "demo").mkdir(parents=True)
+            (root / "skills" / "a1" / "demo" / "SKILL.md").write_text("keep", encoding="utf-8")
+            (root / "channels" / "telegram" / "bindings.json").parent.mkdir(parents=True)
+            (root / "channels" / "telegram" / "bindings.json").write_text("{}", encoding="utf-8")
+            (root / "workspace-a1" / "notes.md").parent.mkdir(parents=True)
+            (root / "workspace-a1" / "notes.md").write_text("keep", encoding="utf-8")
+            (root / "workspace-a1" / "telegram" / "state.json").parent.mkdir(parents=True)
+            (root / "workspace-a1" / "telegram" / "state.json").write_text("{}", encoding="utf-8")
+
+            manifest = build_backup_manifest(root, "openclaw", backup_mode="all", ignore_channel=True)
+            relatives = {item.relative for item in manifest.files}
+            self.assertIn("openclaw.json", relatives)
+            self.assertIn("agents/a1/SOUL.md", relatives)
+            self.assertIn("memory/a1/today.md", relatives)
+            self.assertIn("skills/a1/demo/SKILL.md", relatives)
+            self.assertIn("workspace-a1/notes.md", relatives)
+            self.assertNotIn("telegram_settings.json", relatives)
+            self.assertNotIn("channels/telegram/bindings.json", relatives)
+            self.assertNotIn("workspace-a1/telegram/state.json", relatives)
+            self.assertTrue(any("--ignore-channel" in warning for warning in manifest.warnings))
+            self.assertTrue(manifest.ignore_channel)
+
     def test_backup_exclude_filters_files_and_folders(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -287,6 +319,7 @@ class CoreTests(unittest.TestCase):
             out = Path(td) / "out"
 
             for command in ("backup-all", "backup-slim", "backup-config"):
+                extra_args = ["--ignore-channel"] if command == "backup-all" else []
                 argv = [
                     "agent-brain-transplant",
                     command,
@@ -297,6 +330,7 @@ class CoreTests(unittest.TestCase):
                     "--out-dir",
                     str(out / command),
                     "--dry-run",
+                    *extra_args,
                 ]
                 with mock.patch("sys.argv", argv), contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(main(), 0)

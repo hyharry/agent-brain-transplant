@@ -43,12 +43,44 @@ SECRET_KEY_PATTERN = (
     r"feishu|telegram|tg[_-]?id|allow[_-]?list|allowlist|allowed[_-]?(?:id|ids|user|users)|"
     r"allow[_-]?from|app[_-]?id|group[_-]?id|group[_-]?ids"
 )
+CHANNEL_PATH_PARTS = {
+    "telegram",
+    "whatsapp",
+    "signal",
+    "discord",
+    "slack",
+    "line",
+    "feishu",
+    "imessage",
+    "googlechat",
+    "irc",
+    "matrix",
+    "wechat",
+}
+CHANNEL_NAME_HINTS = {
+    "telegram",
+    "whatsapp",
+    "signal",
+    "discord",
+    "slack",
+    "line",
+    "feishu",
+    "imessage",
+    "googlechat",
+    "irc",
+    "matrix",
+    "wechat",
+    "channel",
+    "channels",
+    "chat",
+    "chats",
+}
 
 LINE_SECRET_RE = re.compile(
     rf"(?im)^([ \t\"']*[A-Za-z0-9_.-]*?(?:{SECRET_KEY_PATTERN})[A-Za-z0-9_.-]*[ \t\"']*)([:=])([ \t]*)([^\n#]+)"
 )
 JSON_STRING_SECRET_RE = re.compile(
-    rf'(?i)("[^"\\]*(?:{SECRET_KEY_PATTERN})[^"\\]*"\s*:\s*")([^"\\]*(?:\\.[^"\\]*)*)(")'
+    rf'(?i)("[^"\\]*(?:{SECRET_KEY_PATTERN})[^"\\]*"\s*:\s*")( [^"\\]*(?:\\.[^"\\]*)*)(")'.replace('( ', '(')
 )
 SESSION_FILE_RE = re.compile(r".*(session|conversation|transcript|chat).*\.(json|jsonl)$", re.IGNORECASE)
 SESSION_DIR_NAMES = {
@@ -124,6 +156,7 @@ class BackupManifest:
     source_root: str
     backup_mode: str
     excludes: list[str]
+    ignore_channel: bool
     selected_agent_name: str | None
     selected_agent_path: str | None
     file_count: int
@@ -137,6 +170,7 @@ class BackupManifest:
             "source_root": self.source_root,
             "backup_mode": self.backup_mode,
             "excludes": self.excludes,
+            "ignore_channel": self.ignore_channel,
             "selected_agent_name": self.selected_agent_name,
             "selected_agent_path": self.selected_agent_path,
             "file_count": self.file_count,
@@ -549,6 +583,27 @@ def _relative_string(path: Path, root: Path) -> str:
     return relative.as_posix()
 
 
+def _path_has_channel_hint(path: Path) -> bool:
+    return any(part.lower() in CHANNEL_PATH_PARTS for part in path.parts)
+
+
+def _looks_like_channel_config_file(path: Path) -> bool:
+    parts = {part.lower() for part in path.parts}
+    stem = path.stem.lower()
+    name = path.name.lower()
+    return bool(parts & CHANNEL_NAME_HINTS or stem in CHANNEL_NAME_HINTS or any(hint in name for hint in CHANNEL_NAME_HINTS))
+
+
+def _ignore_channel_file(relative: Path, category: str, ignore_channel: bool) -> bool:
+    if not ignore_channel:
+        return False
+    if _path_has_channel_hint(relative):
+        return True
+    if category == "platform" and _looks_like_channel_config_file(relative):
+        return True
+    return False
+
+
 def _is_excluded(relative: str, excludes: list[str]) -> bool:
     relative = relative.strip("/")
     relative_parts = relative.split("/") if relative else []
@@ -638,6 +693,7 @@ def build_backup_manifest(
     agent_path: str | None = None,
     backup_mode: str = "selected",
     excludes: list[str] | None = None,
+    ignore_channel: bool = False,
 ) -> BackupManifest:
     profile = get_profile(profile_name)
     if profile.name == "hermes-agent" and (agent_name or agent_path):
@@ -697,6 +753,8 @@ def build_backup_manifest(
             if _is_session_path(candidate, root) or _is_excluded(relative_text, excludes):
                 continue
             category = classify_relative_path(relative, profile, selected_agent_roots, root)
+            if _ignore_channel_file(relative, category, ignore_channel):
+                continue
             if backup_mode == "slim" and category != "platform" and not _is_slim_file(relative):
                 continue
             seen.add(resolved)
@@ -712,11 +770,15 @@ def build_backup_manifest(
             )
             category_counts[category] = category_counts.get(category, 0) + 1
 
+    if ignore_channel:
+        warnings.append("Channel-related files/config were skipped because --ignore-channel was set")
+
     return BackupManifest(
         profile=profile.name,
         source_root=str(root),
         backup_mode=backup_mode,
         excludes=excludes,
+        ignore_channel=ignore_channel,
         selected_agent_name=agent_name,
         selected_agent_path=agent_path,
         file_count=len(planned_files),
@@ -739,6 +801,7 @@ def backup(
     agent_path: str | None = None,
     backup_mode: str = "selected",
     excludes: list[str] | None = None,
+    ignore_channel: bool = False,
     dry_run: bool = False,
     force: bool = False,
 ) -> BackupResult:
@@ -751,6 +814,7 @@ def backup(
         agent_path=agent_path,
         backup_mode=backup_mode,
         excludes=excludes,
+        ignore_channel=ignore_channel,
     )
 
     if dry_run:
