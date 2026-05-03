@@ -8,7 +8,7 @@ import re
 import shutil
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 
 TEXT_SUFFIXES = {
@@ -74,6 +74,54 @@ CHANNEL_NAME_HINTS = {
     "channels",
     "chat",
     "chats",
+}
+CHANNEL_CONFIG_KEYS = {
+    "channel",
+    "channels",
+    "account_id",
+    "accountId",
+    "chat_id",
+    "chatId",
+    "group_id",
+    "groupId",
+    "open_id",
+    "openId",
+    "union_id",
+    "unionId",
+    "user_id",
+    "userId",
+    "thread_id",
+    "threadId",
+    "message_id",
+    "messageId",
+}
+CHANNEL_BINDING_KEY_HINTS = {
+    "binding",
+    "bindings",
+    "route",
+    "routes",
+    "account",
+    "accounts",
+    "chat",
+    "chats",
+    "thread",
+    "threads",
+    "session",
+    "sessions",
+    "surface",
+    "surfaces",
+    "telegram",
+    "whatsapp",
+    "signal",
+    "discord",
+    "slack",
+    "line",
+    "feishu",
+    "imessage",
+    "googlechat",
+    "irc",
+    "matrix",
+    "wechat",
 }
 
 LINE_SECRET_RE = re.compile(
@@ -487,9 +535,75 @@ def _placeholder_for(relative_path: str, key_hint: str, value: str, used: set[st
     return candidate
 
 
-def mask_text(text: str, relative_path: str, secrets: dict[str, dict[str, str]]) -> tuple[str, bool]:
+def _is_channel_key(key: str) -> bool:
+    lowered = key.lower()
+    return lowered in {item.lower() for item in CHANNEL_CONFIG_KEYS} or lowered in CHANNEL_PATH_PARTS
+
+
+def _has_channel_binding_hint(value: Any) -> bool:
+    if isinstance(value, str):
+        lowered = value.lower()
+        return any(hint in lowered for hint in CHANNEL_BINDING_KEY_HINTS)
+    if isinstance(value, dict):
+        return any(_is_channel_key(str(key)) or _has_channel_binding_hint(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_has_channel_binding_hint(item) for item in value)
+    return False
+
+
+def _prune_channel_data(value: Any) -> Any:
+    if isinstance(value, dict):
+        pruned: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if _is_channel_key(str(key)):
+                continue
+            if any(hint in key_text for hint in CHANNEL_BINDING_KEY_HINTS) and _has_channel_binding_hint(item) and not isinstance(item, list):
+                continue
+            cleaned = _prune_channel_data(item)
+            if any(hint in key_text for hint in CHANNEL_BINDING_KEY_HINTS) and isinstance(item, list) and cleaned == []:
+                pruned[key] = []
+                continue
+            pruned[key] = cleaned
+        return pruned
+    if isinstance(value, list):
+        pruned_items = []
+        for item in value:
+            if _has_channel_binding_hint(item):
+                continue
+            cleaned = _prune_channel_data(item)
+            pruned_items.append(cleaned)
+        return pruned_items
+    return value
+
+
+def _post_check_openclaw_json(text: str, *, ignore_channel: bool) -> tuple[str, bool, list[str]]:
+    notes: list[str] = []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as error:
+        notes.append(f"openclaw.json JSON parse failed; left file content unchanged ({error})")
+        return text, False, notes
+
+    changed = False
+    updated = parsed
+    if ignore_channel:
+        pruned = _prune_channel_data(updated)
+        if pruned != updated:
+            updated = pruned
+            changed = True
+            notes.append("Removed channel-related keys/bindings from openclaw.json because --ignore-channel was set")
+
+    normalized = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
+    if normalized != text:
+        changed = True
+    return normalized, changed, notes
+
+
+def mask_text(text: str, relative_path: str, secrets: dict[str, dict[str, str]], *, ignore_channel: bool = False) -> tuple[str, bool, list[str]]:
     used = set(secrets)
     changed = False
+    notes: list[str] = []
 
     def register(key_hint: str, value: str) -> str:
         placeholder = _placeholder_for(relative_path, key_hint, value.strip(), used)
@@ -526,7 +640,11 @@ def mask_text(text: str, relative_path: str, secrets: dict[str, dict[str, str]])
         return f"{key_text}{placeholder}{suffix}"
 
     masked = JSON_STRING_SECRET_RE.sub(json_repl, masked)
-    return masked, changed
+    if Path(relative_path).name == "openclaw.json":
+        masked, post_changed, post_notes = _post_check_openclaw_json(masked, ignore_channel=ignore_channel)
+        changed = changed or post_changed
+        notes.extend(post_notes)
+    return masked, changed, notes
 
 
 def _directory_size(path: Path) -> int:
@@ -704,6 +822,7 @@ def build_backup_manifest(
     warnings: list[str] = []
     if profile.name == "hermes-agent":
         warnings.extend(_hermes_access_warnings(root))
+    postcheck_notes: list[str] = []
 
     selected_agent_roots = [] if backup_mode in {"all", "config", "slim"} else discover_agent_paths(root, agent_name=agent_name, agent_path=agent_path)
     if backup_mode == "selected" and agent_name and not selected_agent_roots:
@@ -827,6 +946,7 @@ def backup(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     secrets: dict[str, dict[str, str]] = {}
+    postcheck_notes: list[str] = []
 
     for planned in manifest.files:
         src = Path(planned.source)
@@ -835,13 +955,18 @@ def backup(
         if planned.text_mode:
             try:
                 content = src.read_text(encoding="utf-8")
-                masked_content, _ = mask_text(content, planned.relative, secrets)
+                masked_content, _, notes = mask_text(content, planned.relative, secrets, ignore_channel=ignore_channel)
+                postcheck_notes.extend(notes)
                 dst.write_text(masked_content, encoding="utf-8")
             except UnicodeDecodeError:
                 shutil.copy2(src, dst)
         else:
             shutil.copy2(src, dst)
 
+    if postcheck_notes:
+        for note in postcheck_notes:
+            if note not in manifest.warnings:
+                manifest.warnings.append(note)
     manifest_file.write_text(json.dumps(manifest.to_dict(), indent=2), encoding="utf-8")
     private_secrets_file.write_text(json.dumps(secrets, indent=2), encoding="utf-8")
     return BackupResult(manifest=manifest, secrets=secrets)

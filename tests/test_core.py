@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agent_brain_transplant.core import (
     PlannerError,
+    _post_check_openclaw_json,
     apply_secrets,
     backup,
     build_backup_manifest,
@@ -32,10 +33,11 @@ class CoreTests(unittest.TestCase):
     def test_mask_text_extracts_multiple_secret_styles(self):
         secrets = {}
         text = '{"api_key": "abc123", "safe": "ok"}\npassword: xyz\nchat_id=12345\n'
-        masked, changed = mask_text(text, "openclaw.json", secrets)
+        masked, changed, notes = mask_text(text, "openclaw.json", secrets)
         self.assertTrue(changed)
         self.assertIn("__ABT_SECRET_", masked)
         self.assertEqual(len(secrets), 3)
+        self.assertTrue(any("JSON parse failed" in note for note in notes))
         for meta in secrets.values():
             self.assertIn("value", meta)
             self.assertIn("path", meta)
@@ -54,9 +56,10 @@ class CoreTests(unittest.TestCase):
                 "appId: cli_app_id",
             ]
         )
-        masked, changed = mask_text(text, ".env", secrets)
+        masked, changed, notes = mask_text(text, ".env", secrets)
         self.assertTrue(changed)
         self.assertEqual(len(secrets), 7)
+        self.assertEqual(notes, [])
         self.assertIn("__ABT_SECRET_", masked)
         for value in ("ou_private", "123456", "-10098765", "123,456,789", "42,84", "personal-source", "cli_app_id"):
             self.assertNotIn(value, masked)
@@ -65,6 +68,42 @@ class CoreTests(unittest.TestCase):
         self.assertIn("-10098765", stored_values)
         self.assertIn("personal-source", stored_values)
         self.assertIn("cli_app_id", stored_values)
+
+    def test_post_check_openclaw_json_prunes_channel_bindings_and_keeps_valid_json(self):
+        text = json.dumps(
+            {
+                "runtime": {"model": "x"},
+                "channel": "telegram",
+                "plugins": {
+                    "entries": {
+                        "telegram": {"token": "abc", "chat_id": "123"},
+                        "memory": {"enabled": True},
+                    }
+                },
+                "agentBindings": [
+                    {"agent": "main", "channel": "telegram", "accountId": "acc-1"},
+                    {"agent": "worker", "channel": "discord", "threadId": "t-1"},
+                ],
+                "keep": {"safe": True},
+            }
+        )
+        updated, changed, notes = _post_check_openclaw_json(text, ignore_channel=True)
+        self.assertTrue(changed)
+        self.assertTrue(notes)
+        parsed = json.loads(updated)
+        self.assertEqual(parsed["runtime"], {"model": "x"})
+        self.assertEqual(parsed["keep"], {"safe": True})
+        self.assertNotIn("channel", parsed)
+        self.assertNotIn("telegram", parsed["plugins"]["entries"])
+        self.assertEqual(parsed["plugins"]["entries"]["memory"], {"enabled": True})
+        self.assertEqual(parsed["agentBindings"], [])
+
+    def test_post_check_openclaw_json_leaves_invalid_json_unchanged_with_note(self):
+        text = '{"plugins": { invalid }'
+        updated, changed, notes = _post_check_openclaw_json(text, ignore_channel=True)
+        self.assertEqual(updated, text)
+        self.assertFalse(changed)
+        self.assertTrue(any("JSON parse failed" in note for note in notes))
 
     def test_build_backup_manifest_includes_platform_agent_and_work(self):
         with tempfile.TemporaryDirectory() as td:
@@ -255,7 +294,24 @@ class CoreTests(unittest.TestCase):
     def test_ignore_channel_skips_channel_files_and_config(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "openclaw.json").write_text("{}", encoding="utf-8")
+            (root / "openclaw.json").write_text(
+                json.dumps(
+                    {
+                        "channel": "telegram",
+                        "plugins": {
+                            "entries": {
+                                "telegram": {"token": "abc", "chat_id": "123"},
+                                "memory": {"enabled": True},
+                            }
+                        },
+                        "agentBindings": [
+                            {"agent": "main", "channel": "telegram", "accountId": "acc-1"}
+                        ],
+                        "runtime": {"model": "x"},
+                    }
+                ),
+                encoding="utf-8",
+            )
             (root / "telegram_settings.json").write_text('{"token": "abc"}', encoding="utf-8")
             (root / "agents" / "a1").mkdir(parents=True)
             (root / "agents" / "a1" / "SOUL.md").write_text("hello", encoding="utf-8")
@@ -282,6 +338,16 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("workspace-a1/telegram/state.json", relatives)
             self.assertTrue(any("--ignore-channel" in warning for warning in manifest.warnings))
             self.assertTrue(manifest.ignore_channel)
+
+            out = Path(td) / "out"
+            result = backup(root, "openclaw", out, backup_mode="all", ignore_channel=True)
+            restored_openclaw = json.loads((out / "public_bundle" / "openclaw.json").read_text(encoding="utf-8"))
+            self.assertEqual(restored_openclaw["runtime"], {"model": "x"})
+            self.assertNotIn("telegram", restored_openclaw["plugins"]["entries"])
+            self.assertEqual(restored_openclaw["plugins"]["entries"]["memory"], {"enabled": True})
+            self.assertEqual(restored_openclaw["agentBindings"], [])
+            self.assertNotIn("channel", restored_openclaw)
+            self.assertTrue(any("openclaw.json" in warning for warning in result.manifest.warnings))
 
     def test_backup_exclude_filters_files_and_folders(self):
         with tempfile.TemporaryDirectory() as td:

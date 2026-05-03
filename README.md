@@ -77,6 +77,8 @@ Useful options:
 
 `--ignore-channel` skips channel-related files/config (for example Telegram, WhatsApp, Feishu, Discord, Signal) so you can deliver memory, skills, prompts, and settings into a fresh environment and bind new channels there instead of reusing the old ones.
 
+For `openclaw.json`, `--ignore-channel` also performs a JSON post-check/cleanup pass: it removes embedded channel keys, per-channel config blocks, and channel/agent binding records while keeping the remaining JSON valid. If `openclaw.json` cannot be parsed as valid JSON, the file content is left unchanged and a warning is recorded in the manifest.
+
 ## Restore
 
 Restore public files first:
